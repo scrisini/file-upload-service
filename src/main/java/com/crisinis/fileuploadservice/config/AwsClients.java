@@ -54,13 +54,15 @@ class AwsClients {
     @Bean(destroyMethod = "close")
     S3Presigner s3Presigner(FileUploadServiceProperties properties) {
         FileUploadServiceProperties.Aws aws = properties.aws();
+        // browsers use these URLs, so they carry the address browsers reach S3 by
+        String endpoint = aws.presignEndpoint();
         S3Presigner.Builder builder = S3Presigner.builder()
-                .serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(!aws.s3Endpoint().isEmpty()).build());
+                .serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(!endpoint.isEmpty()).build());
         if (!aws.region().isEmpty()) {
             builder.region(Region.of(aws.region()));
         }
-        if (!aws.s3Endpoint().isEmpty()) {
-            builder.endpointOverride(URI.create(aws.s3Endpoint()));
+        if (!endpoint.isEmpty()) {
+            builder.endpointOverride(URI.create(endpoint));
         }
         return builder.build();
     }

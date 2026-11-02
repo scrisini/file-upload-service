@@ -5,14 +5,19 @@
 #   scripts/dev.sh check            verify prerequisites
 #   scripts/dev.sh infra            start dependencies (docker-compose.yml) and wait until healthy
 #   scripts/dev.sh run [args...]    check, start dependencies, then run the app in the foreground
+#   scripts/dev.sh docker [args...] the same, with the app in Docker: builds its image (as production
+#                                   does) and runs it with a read-only filesystem
 #   scripts/dev.sh status           show dependency and app health
 #   scripts/dev.sh test             run the test suite
 #   scripts/dev.sh stop             stop dependencies, keeping their data
 #   scripts/dev.sh reset [--yes]    stop dependencies and delete all of their data
 #   scripts/dev.sh hooks            install the git hooks in .githooks (commit messages, plaintext secrets)
 #
-# Extra arguments to `run` are passed to Spring Boot, e.g.
+# Extra arguments to `run` and `docker` are passed to Spring Boot, e.g.
 #   scripts/dev.sh run --logging.level.com.crisinis.fileuploadservice=DEBUG
+#
+# The app listens on SERVER_PORT (default 8080). If that port is taken, `run` and `docker` ask for
+# another one, and remember it for `status` and scripts/try-upload.sh.
 #
 # Environment variables are read by the app as usual (see README "Configuration"). With
 # FILE_UPLOAD_SERVICE_PROXY_HOST set (plus FILE_UPLOAD_SERVICE_PROXY_TYPE and _PORT), `check` tests the proxy and
@@ -24,7 +29,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-APP_PORT="${SERVER_PORT:-8080}"
+DEFAULT_APP_PORT=8080
+# the port chosen by the last `run` or `docker`, for `status` and try-upload.sh (build/ isn't committed)
+PORT_FILE="build/dev-port"
+APP_PORT="${SERVER_PORT:-$DEFAULT_APP_PORT}"
+APP_IMAGE="file-upload-service:dev"
+APP_CONTAINER="file-upload-service-app"
 MIN_JAVA=17
 PROXY_TYPE="${FILE_UPLOAD_SERVICE_PROXY_TYPE:-HTTP}"
 PROXY_HOST="${FILE_UPLOAD_SERVICE_PROXY_HOST:-}"
@@ -106,8 +116,7 @@ cmd_check() {
     fi
 
     if listening "$APP_PORT"; then
-        fail "port $APP_PORT is in use; stop that process or set SERVER_PORT (is the app already running?)"
-        missing=1
+        warn "port $APP_PORT is in use; 'run' and 'docker' will ask for another (or set SERVER_PORT)"
     else
         ok "port $APP_PORT available for the app"
     fi
@@ -209,9 +218,49 @@ use_local_aws() {
     ok "AWS services: local emulators; GuardDuty: simulated (EICAR test string = infected)"
 }
 
+# A port number a user may pick: 1024-65535
+valid_port() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$1" -ge 1024 ] && [ "$1" -le 65535 ]
+}
+
+# Settles APP_PORT on a free port, asking for another while it's taken, then exports it as
+# SERVER_PORT (the app and docker-compose.yml read it) and remembers it in $PORT_FILE.
+choose_app_port() {
+    local answer
+    while listening "$APP_PORT"; do
+        if [ ! -t 0 ]; then
+            die "port $APP_PORT is in use and there's no terminal to ask for another; set SERVER_PORT to a free port"
+        fi
+        warn "port $APP_PORT is in use: $(lsof -nP -iTCP:"$APP_PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR == 2 { print $1 " (pid " $2 ")" }')"
+        printf '  Port for file-upload-service instead (1024-65535, Enter for %s): ' "$((APP_PORT + 1))"
+        read -r answer || die "no port given"
+        answer="${answer:-$((APP_PORT + 1))}"
+        if valid_port "$answer"; then
+            APP_PORT="$answer"
+        else
+            warn "'$answer' is not a port between 1024 and 65535"
+        fi
+    done
+    export SERVER_PORT="$APP_PORT"
+    mkdir -p "$(dirname "$PORT_FILE")"
+    printf '%s\n' "$APP_PORT" > "$PORT_FILE"
+    ok "the app will listen on port $APP_PORT"
+}
+
+# The port the app was last started on, unless SERVER_PORT says otherwise
+remembered_port() {
+    if [ -z "${SERVER_PORT:-}" ] && [ -f "$PORT_FILE" ]; then
+        APP_PORT="$(cat "$PORT_FILE")"
+    fi
+}
+
 cmd_run() {
     cmd_check
     cmd_infra
+    choose_app_port
     use_local_aws
     step "Starting file-upload-service on http://localhost:$APP_PORT (Ctrl-C to stop)"
     local app=(./gradlew bootRun --console=plain)
@@ -226,7 +275,23 @@ cmd_run() {
     exec "${app[@]}"
 }
 
+cmd_docker() {
+    cmd_check
+    has_compose || die "docker-compose.yml is missing"
+    command -v docker >/dev/null 2>&1 || die "Docker is required for 'docker'"
+    cmd_infra
+    choose_app_port
+    step "Building the image $APP_IMAGE (Cloud Native Buildpacks, as in production; the first build takes a few minutes)"
+    ./gradlew bootBuildImage --imageName="$APP_IMAGE" --console=plain -q
+    ok "image $APP_IMAGE built"
+    step "Starting file-upload-service in Docker on http://localhost:$APP_PORT (Ctrl-C to stop)"
+    ok "AWS services: local emulators; GuardDuty: simulated (EICAR test string = infected)"
+    # in the foreground, like `run`; removed when it stops. Arguments go to Spring Boot.
+    exec docker compose --profile app run --rm --service-ports --name "$APP_CONTAINER" app "$@"
+}
+
 cmd_status() {
+    remembered_port
     step "Status"
     if has_compose; then
         docker compose ps --format '  {{.Service}}: {{.Status}}' 2>/dev/null || fail "docker compose not available"
@@ -244,10 +309,20 @@ cmd_status() {
     fi
 }
 
+# The app's container from `docker`: `docker compose stop` passes over containers started with
+# `docker compose run`, so it's stopped by name (and removes itself)
+stop_app_container() {
+    if docker ps -q --filter "name=^${APP_CONTAINER}\$" | grep -q .; then
+        docker stop "$APP_CONTAINER" >/dev/null
+        ok "stopped the app container $APP_CONTAINER"
+    fi
+}
+
 cmd_stop() {
     has_compose || { step "No docker-compose.yml; nothing to stop"; return; }
-    step "Stopping dependencies (data is kept)"
-    docker compose stop
+    step "Stopping the app container, if any, and dependencies (data is kept)"
+    stop_app_container
+    docker compose --profile app stop
 }
 
 cmd_reset() {
@@ -262,7 +337,8 @@ cmd_reset() {
         esac
     fi
     step "Removing dependency containers and data volumes"
-    docker compose down --volumes
+    stop_app_container
+    docker compose --profile app down --volumes
 }
 
 cmd_hooks() {
@@ -279,7 +355,7 @@ cmd_test() {
 }
 
 usage() {
-    sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 command="${1:-help}"
@@ -288,6 +364,7 @@ case "$command" in
     check)  cmd_check ;;
     infra)  cmd_infra ;;
     run)    cmd_run "$@" ;;
+    docker) cmd_docker "$@" ;;
     status) cmd_status ;;
     stop)   cmd_stop ;;
     reset)  cmd_reset "$@" ;;

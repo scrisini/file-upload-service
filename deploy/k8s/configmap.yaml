@@ -9,6 +9,8 @@ data:
   FILE_UPLOAD_SERVICE_MODE: production
   FILE_UPLOAD_SERVICE_ENVIRONMENT: prod
   FILE_UPLOAD_SERVICE_LOG_FORMAT: ecs
+  # No OpenAPI description or Swagger UI in production (production mode refuses them)
+  FILE_UPLOAD_SERVICE_API_DOCS: "false"
   FILE_UPLOAD_SERVICE_SSM_PATH: /file-upload-service/prod/                   # CHANGE
   FILE_UPLOAD_SERVICE_SSM_REGION: ap-southeast-2                          # CHANGE
   FILE_UPLOAD_SERVICE_VAULT_ADDRESS: https://vault.internal:8200          # CHANGE

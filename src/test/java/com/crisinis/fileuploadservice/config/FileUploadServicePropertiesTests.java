@@ -34,6 +34,19 @@ class FileUploadServicePropertiesTests {
     }
 
     @Test
+    void presignedUrlsUseThePresignEndpointWhenSet() {
+        assertThat(TestProperties.of(Map.of("file-upload-service.aws.s3-endpoint", "http://s3:9090"))
+                .aws().presignEndpoint()).isEqualTo("http://s3:9090");
+        FileUploadServiceProperties inDocker = TestProperties.of(Map.of(
+                "file-upload-service.aws.s3-endpoint", "http://s3:9090",
+                "file-upload-service.aws.s3-presign-endpoint", "http://localhost:9099"));
+        assertThat(inDocker.aws().presignEndpoint()).isEqualTo("http://localhost:9099");
+        assertThat(TestProperties.defaults().aws().presignEndpoint()).isEmpty();
+        assertThat(TestProperties.of(Map.of("file-upload-service.aws.s3-presign-endpoint", "http://localhost:9099"))
+                .aws().overridden()).as("an emulator setting, refused in production").isTrue();
+    }
+
+    @Test
     void acceptsOneBucketWithSeparateFolders() {
         FileUploadServiceProperties properties = TestProperties.of(Map.of(
                 "file-upload-service.storage.clean-bucket", "file-upload-quarantine",

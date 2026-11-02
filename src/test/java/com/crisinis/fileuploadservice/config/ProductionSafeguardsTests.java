@@ -19,6 +19,8 @@ class ProductionSafeguardsTests {
             "file-upload-service.ssm.path", "/service/prod/",
             "file-upload-service.vault.address", "https://vault.internal:8200",
             "file-upload-service.scan.queue-url", "https://sqs.ap-southeast-2.amazonaws.com/123456789012/scan-events",
+            "springdoc.api-docs.enabled", "false",
+            "springdoc.swagger-ui.enabled", "false",
             "logging.structured.format.console", "ecs");
 
     @Test
@@ -35,10 +37,11 @@ class ProductionSafeguardsTests {
     void productionModeNamesEveryUnsafeSetting() {
         List<String> violations = ProductionSafeguards.violations(binder(Map.of("file-upload-service.mode", "PRODUCTION")));
 
-        assertThat(violations).hasSize(4)
+        assertThat(violations).hasSize(5)
                 .anySatisfy(v -> assertThat(v).startsWith("file-upload-service.ssm.path"))
                 .anySatisfy(v -> assertThat(v).startsWith("file-upload-service.vault.address"))
                 .anySatisfy(v -> assertThat(v).startsWith("file-upload-service.scan.queue-url"))
+                .anySatisfy(v -> assertThat(v).contains("FILE_UPLOAD_SERVICE_API_DOCS=false"))
                 .anySatisfy(v -> assertThat(v).contains("FILE_UPLOAD_SERVICE_LOG_FORMAT=ecs"));
     }
 

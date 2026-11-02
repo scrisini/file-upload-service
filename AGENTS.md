@@ -38,7 +38,8 @@ promotes clean files. README "File lifecycle" has the states.
 ./gradlew test                 # all tests (offline); must pass before committing
 ./gradlew compileJava          # fast compile check
 scripts/dev.sh check           # verify local prerequisites
-scripts/dev.sh run [args...]   # start dependencies, then the app on :8080; args go to Spring Boot
+scripts/dev.sh run [args...]   # start dependencies, then the app on :8080 (asks if taken); args go to Spring Boot
+scripts/dev.sh docker [args...] # the same with the app in Docker, built as production builds it
 scripts/dev.sh status          # dependency and app health
 scripts/dev.sh hooks           # install the git hooks: commit messages, plaintext secrets (once per clone)
 scripts/test-commit-msg.sh     # test the hook after changing it or .commitlintrc.json
@@ -341,3 +342,10 @@ BREAKING-CHANGE: <what breaks and how to migrate>
 
 <!-- Gotchas specific to this service: library quirks and workarounds, invariants, operational
      notes. Add to this as you learn them. -->
+
+- **Branch rules aren't enforced by GitHub.** `scrisini/file-upload-service` is a private
+  repository on a free plan, so GitHub refuses rulesets (HTTP 403). `scripts/github-branch-rules.sh
+  --apply` set only the merge settings: squash titled by the PR title with the commit messages,
+  merge commits allowed, rebase off. Follow "Branching and merging" by hand: no direct pushes to
+  `main` or `develop`, squash into `main`, merge commits into `develop`, `commitlint` green before
+  merging. Re-run the script with `--apply` after upgrading to GitHub Pro (or going public).
