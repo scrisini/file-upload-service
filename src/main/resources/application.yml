@@ -103,6 +103,19 @@ file-upload-service:
     host: ${FILE_UPLOAD_SERVICE_PROXY_HOST:}
     port: ${FILE_UPLOAD_SERVICE_PROXY_PORT:8888}
 
+# OpenAPI spec at /v3/api-docs and Swagger UI at /swagger-ui.html, for the /api/** endpoints only.
+# Off in production unless deliberately turned on (README "API documentation").
+springdoc:
+  api-docs:
+    enabled: ${FILE_UPLOAD_SERVICE_API_DOCS:true}
+  swagger-ui:
+    enabled: ${FILE_UPLOAD_SERVICE_API_DOCS:true}
+    # list operations in the order they're declared: the two upload styles first
+    operations-sorter: method
+    try-it-out-enabled: true
+  paths-to-match: /api/**
+  show-actuator: false
+
 management:
   endpoints:
     web:

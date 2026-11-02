@@ -29,6 +29,8 @@ dependencies {
     implementation("software.amazon.awssdk:sqs")
     implementation("software.amazon.awssdk:dynamodb")
     implementation("software.amazon.awssdk:url-connection-client")
+    // OpenAPI spec and Swagger UI (not in Spring Boot's BOM; 3.2.0 is built against Boot 4.1.2)
+    implementation("org.springdoc:springdoc-openapi-starter-webmvc-ui:3.2.0")
 
     compileOnly("org.projectlombok:lombok")
     annotationProcessor("org.projectlombok:lombok")
