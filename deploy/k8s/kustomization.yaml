@@ -1,0 +1,20 @@
+# file-upload-service on Kubernetes (EKS) behind an AWS Application Load Balancer. See docs/deployment.md.
+#   kubectl apply -k deploy/k8s            (after editing the values marked CHANGE)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: file-upload-service
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: file-upload-service
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - pdb.yaml
+  - ingress.yaml
+images:
+  - name: file-upload-service
+    newName: 123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/file-upload-service   # CHANGE: your registry
+    newTag: 1.0.0                                                                # CHANGE: the release to run

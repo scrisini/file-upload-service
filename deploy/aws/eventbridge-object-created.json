@@ -1,0 +1,8 @@
+{
+  "source": ["aws.s3"],
+  "detail-type": ["Object Created"],
+  "detail": {
+    "bucket": {"name": ["file-upload-quarantine"]},
+    "object": {"key": [{"prefix": "uploads/"}]}
+  }
+}

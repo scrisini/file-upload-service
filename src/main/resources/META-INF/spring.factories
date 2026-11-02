@@ -1,0 +1,7 @@
+# Startup loaders for spring.config.import=file-upload-service-ssm: and file-upload-service-vault: (application.yml)
+org.springframework.boot.context.config.ConfigDataLocationResolver=\
+com.crisinis.fileuploadservice.configdata.SsmConfigData$Resolver,\
+com.crisinis.fileuploadservice.configdata.VaultConfigData$Resolver
+org.springframework.boot.context.config.ConfigDataLoader=\
+com.crisinis.fileuploadservice.configdata.SsmConfigData$Loader,\
+com.crisinis.fileuploadservice.configdata.VaultConfigData$Loader

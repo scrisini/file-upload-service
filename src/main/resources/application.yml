@@ -1,0 +1,148 @@
+spring:
+  application:
+    name: file-upload-service
+  config:
+    # Configuration from AWS SSM Parameter Store, then secrets from Vault, read once at startup. Each
+    # does nothing until file-upload-service.ssm.path / .vault.address is set below ("optional"
+    # covers only that: a configured store that can't be read stops startup). README "Configuration
+    # and secrets"; precedence: command line > environment > Vault > Parameter Store > this file.
+    import:
+      - "optional:file-upload-service-ssm:"
+      - "optional:file-upload-service-vault:"
+  threads:
+    virtual:
+      enabled: true
+  servlet:
+    multipart:
+      # No multipart parsing: the servlet container spools multipart bodies to temporary files, and
+      # this service must not need a filesystem. Streamed uploads send the file as the raw body.
+      enabled: false
+  lifecycle:
+    # Each shutdown phase waits at most this long; the container's stop timeout must cover it
+    # (docs/deployment.md "Timeouts").
+    timeout-per-shutdown-phase: 30s
+
+server:
+  port: ${SERVER_PORT:8080}
+  # On SIGTERM: stop accepting, let in-flight requests finish, then stop (the default, made explicit).
+  shutdown: graceful
+  tomcat:
+    # Must outlast the load balancer's idle timeout (ALB: 120s in docs/deployment.md), or the load
+    # balancer reuses a connection Tomcat is closing and the client gets a 502. Tomcat's default is 60s.
+    keep-alive-timeout: ${FILE_UPLOAD_SERVICE_SERVER_KEEP_ALIVE_TIMEOUT:130s}
+
+# Every setting is bound to FileUploadServiceProperties and documented in README "Configuration".
+file-upload-service:
+  # production refuses settings that are unsafe there (README "Production mode")
+  mode: ${FILE_UPLOAD_SERVICE_MODE:development}
+  # Re-reads Parameter Store and Vault and checks a restart would succeed (README "Checking the
+  # stored configuration"); also on demand: POST /actuator/configcheck
+  config-check:
+    interval: ${FILE_UPLOAD_SERVICE_CONFIG_CHECK_INTERVAL:5m}
+  # AWS SSM Parameter Store: /file-upload-service/prod/file-upload-service/some-setting sets
+  # file-upload-service.some-setting. Blank path = off. Credentials and region from the AWS SDK default
+  # chain; reached directly (VPC endpoint), not through the outbound proxy.
+  ssm:
+    path: ${FILE_UPLOAD_SERVICE_SSM_PATH:}
+    region: ${FILE_UPLOAD_SERVICE_SSM_REGION:}
+    endpoint: ${FILE_UPLOAD_SERVICE_SSM_ENDPOINT:}
+  # HashiCorp Vault key/value secret whose keys are property names. Blank address = off; https only
+  # (http for localhost). Reached directly on the private network.
+  vault:
+    address: ${FILE_UPLOAD_SERVICE_VAULT_ADDRESS:}
+    kv-mount: ${FILE_UPLOAD_SERVICE_VAULT_KV_MOUNT:secret}
+    path: ${FILE_UPLOAD_SERVICE_VAULT_PATH:file-upload-service}
+    kv-version: 2
+    namespace: ${FILE_UPLOAD_SERVICE_VAULT_NAMESPACE:}
+    ca-cert: ${FILE_UPLOAD_SERVICE_VAULT_CA_CERT:}
+    # token | kubernetes | app-role
+    auth: ${FILE_UPLOAD_SERVICE_VAULT_AUTH:token}
+    token: ${FILE_UPLOAD_SERVICE_VAULT_TOKEN:}
+    kubernetes:
+      role: ${FILE_UPLOAD_SERVICE_VAULT_KUBERNETES_ROLE:}
+    app-role:
+      role-id: ${FILE_UPLOAD_SERVICE_VAULT_APP_ROLE_ID:}
+      secret-id-file: ${FILE_UPLOAD_SERVICE_VAULT_APP_ROLE_SECRET_ID_FILE:}
+  # S3, SQS and DynamoDB. Region and credentials from the AWS SDK's default chain (EKS Pod Identity
+  # or IRSA); endpoints only for local emulators (production refuses them). Reached through VPC
+  # endpoints, not the outbound proxy.
+  aws:
+    region: ${FILE_UPLOAD_SERVICE_AWS_REGION:}
+    s3-endpoint: ${FILE_UPLOAD_SERVICE_S3_ENDPOINT:}
+    sqs-endpoint: ${FILE_UPLOAD_SERVICE_SQS_ENDPOINT:}
+    dynamodb-endpoint: ${FILE_UPLOAD_SERVICE_DYNAMODB_ENDPOINT:}
+    timeout: ${FILE_UPLOAD_SERVICE_AWS_TIMEOUT:10s}
+  # Uploads land in the quarantine bucket (GuardDuty Malware Protection protects it); clean files
+  # move to the clean bucket. Records of every file are in the DynamoDB table.
+  storage:
+    quarantine-bucket: ${FILE_UPLOAD_SERVICE_QUARANTINE_BUCKET:file-upload-quarantine}
+    quarantine-prefix: ${FILE_UPLOAD_SERVICE_QUARANTINE_PREFIX:uploads/}
+    clean-bucket: ${FILE_UPLOAD_SERVICE_CLEAN_BUCKET:file-upload-clean}
+    clean-prefix: ${FILE_UPLOAD_SERVICE_CLEAN_PREFIX:files/}
+    table: ${FILE_UPLOAD_SERVICE_TABLE:file-upload-service-files}
+  uploads:
+    max-size: ${FILE_UPLOAD_SERVICE_MAX_SIZE:25MB}
+    allowed-types: ${FILE_UPLOAD_SERVICE_ALLOWED_TYPES:JPEG,PNG,GIF,WEBP,HEIC,TIFF,PDF}
+    url-ttl: ${FILE_UPLOAD_SERVICE_URL_TTL:15m}
+    max-concurrent-streams: ${FILE_UPLOAD_SERVICE_MAX_CONCURRENT_STREAMS:64}
+    stream-timeout: ${FILE_UPLOAD_SERVICE_STREAM_TIMEOUT:5m}
+  # GuardDuty's results and S3's "Object Created" events, routed by EventBridge to this SQS queue.
+  # Blank queue = no scanning (production refuses that).
+  scan:
+    queue-url: ${FILE_UPLOAD_SERVICE_SCAN_QUEUE_URL:}
+    consumers: ${FILE_UPLOAD_SERVICE_SCAN_CONSUMERS:2}
+    overdue-after: ${FILE_UPLOAD_SERVICE_SCAN_OVERDUE_AFTER:5m}
+    monitor-interval: ${FILE_UPLOAD_SERVICE_SCAN_MONITOR_INTERVAL:15s}
+    # Local stand-in for GuardDuty (scripts/dev.sh turns it on); production refuses it
+    simulator:
+      enabled: ${FILE_UPLOAD_SERVICE_SCAN_SIMULATOR:false}
+      delay: ${FILE_UPLOAD_SERVICE_SCAN_SIMULATOR_DELAY:3s}
+  # Proxy for all outgoing connections to external hosts; blank host = direct.
+  outbound-proxy:
+    type: ${FILE_UPLOAD_SERVICE_PROXY_TYPE:HTTP}     # HTTP (tinyproxy, Squid) or SOCKS
+    host: ${FILE_UPLOAD_SERVICE_PROXY_HOST:}
+    port: ${FILE_UPLOAD_SERVICE_PROXY_PORT:8888}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,configcheck
+  endpoint:
+    health:
+      show-details: always
+      # /actuator/health/liveness and /readiness everywhere, not only on Kubernetes: load balancer
+      # health checks use readiness (docs/deployment.md)
+      probes:
+        enabled: true
+  info:
+    env:
+      enabled: true
+  metrics:
+    tags:
+      application: file-upload-service
+      mode: ${file-upload-service.mode}
+    distribution:
+      # REST calls are timed by Spring as http.server.requests (tags: method, uri, status, outcome)
+      percentiles:
+        http.server.requests: 0.5,0.95,0.99
+        file-upload-service: 0.5,0.95,0.99
+
+# /actuator/info
+info:
+  mode: ${file-upload-service.mode}
+
+logging:
+  level:
+    com.crisinis.fileuploadservice: INFO
+  structured:
+    format:
+      # ecs in production: one Elastic Common Schema JSON object per line (ELK, Splunk, New Relic).
+      # Blank (the default) gives the readable text pattern below. See docs/runbook.md.
+      console: ${FILE_UPLOAD_SERVICE_LOG_FORMAT:}
+    ecs:
+      service:
+        environment: ${FILE_UPLOAD_SERVICE_ENVIRONMENT:local}
+  pattern:
+    # Text format: the request id after the logger, catalogued details as key="value"
+    console: "%d{HH:mm:ss.SSS} %5p [%t] %logger{36} %X{http.request.id} - %m %kvp%n%ex"

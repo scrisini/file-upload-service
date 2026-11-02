@@ -1,0 +1,19 @@
+# Only what an instance needs to find its configuration. Everything else comes from SSM Parameter
+# Store (settings) and Vault (secrets): README "Configuration and secrets".
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: file-upload-service-env
+data:
+  # Refuses unsafe settings at startup and in the configuration check (README "Production mode")
+  FILE_UPLOAD_SERVICE_MODE: production
+  FILE_UPLOAD_SERVICE_ENVIRONMENT: prod
+  FILE_UPLOAD_SERVICE_LOG_FORMAT: ecs
+  FILE_UPLOAD_SERVICE_SSM_PATH: /file-upload-service/prod/                   # CHANGE
+  FILE_UPLOAD_SERVICE_SSM_REGION: ap-southeast-2                          # CHANGE
+  FILE_UPLOAD_SERVICE_VAULT_ADDRESS: https://vault.internal:8200          # CHANGE
+  FILE_UPLOAD_SERVICE_VAULT_AUTH: kubernetes
+  FILE_UPLOAD_SERVICE_VAULT_KUBERNETES_ROLE: file-upload-service
+  FILE_UPLOAD_SERVICE_VAULT_PATH: file-upload-service/prod
+  # The image's launcher prints a native-memory report to stdout at exit; keep stdout JSON only
+  BPL_JAVA_NMT_ENABLED: "false"

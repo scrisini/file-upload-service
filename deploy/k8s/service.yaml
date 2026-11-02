@@ -1,0 +1,12 @@
+# HTTP for the ALB (target-type ip sends straight to pod IPs; the Service just lists them).
+apiVersion: v1
+kind: Service
+metadata:
+  name: file-upload-service
+spec:
+  selector:
+    app.kubernetes.io/name: file-upload-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

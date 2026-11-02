@@ -1,0 +1,42 @@
+# Local stand-ins for the AWS services file-upload-service uses (scripts/dev.sh infra). All are
+# free emulators; none needs an account. GuardDuty and EventBridge have no emulator: the service's
+# own simulator (FILE_UPLOAD_SERVICE_SCAN_SIMULATOR, on with scripts/dev.sh run) plays their part.
+# Data lives only in the containers: `scripts/dev.sh reset` (or a restart) empties them.
+services:
+  s3:
+    # S3 API on :9099 (http). Buckets created at startup.
+    image: adobe/s3mock:4.11.0
+    environment:
+      COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS: file-upload-quarantine,file-upload-clean
+    ports:
+      - "9099:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9090/file-upload-quarantine"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  sqs:
+    # SQS API on :9324; queues from config/local/elasticmq.conf
+    image: softwaremill/elasticmq-native:1.7.1
+    volumes:
+      - ./config/local/elasticmq.conf:/opt/elasticmq.conf:ro
+    ports:
+      - "9324:9324"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9324/?Action=ListQueues"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  dynamodb:
+    # DynamoDB API on :8000; scripts/dev.sh creates the table from deploy/aws/dynamodb-table.json
+    image: amazon/dynamodb-local:3.3.0
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null localhost:8000 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20

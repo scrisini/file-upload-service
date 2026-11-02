@@ -1,0 +1,23 @@
+{
+  "TableName": "file-upload-service-files",
+  "BillingMode": "PAY_PER_REQUEST",
+  "AttributeDefinitions": [
+    {"AttributeName": "id", "AttributeType": "S"},
+    {"AttributeName": "scanQueue", "AttributeType": "S"},
+    {"AttributeName": "submittedAt", "AttributeType": "N"}
+  ],
+  "KeySchema": [
+    {"AttributeName": "id", "KeyType": "HASH"}
+  ],
+  "GlobalSecondaryIndexes": [
+    {
+      "IndexName": "scanning",
+      "KeySchema": [
+        {"AttributeName": "scanQueue", "KeyType": "HASH"},
+        {"AttributeName": "submittedAt", "KeyType": "RANGE"}
+      ],
+      "Projection": {"ProjectionType": "KEYS_ONLY"}
+    }
+  ],
+  "SSESpecification": {"Enabled": true}
+}

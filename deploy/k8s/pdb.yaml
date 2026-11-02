@@ -1,0 +1,10 @@
+# Node drains and upgrades take one pod at a time, like rolling updates.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: file-upload-service
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: file-upload-service
