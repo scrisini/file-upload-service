@@ -7,11 +7,14 @@
 #   scripts/try-upload.sh stream    <file> [content-type]
 #
 # The content type defaults to what `file --mime-type` says. FILE_UPLOAD_SERVICE_URL picks the
-# instance (default http://localhost:8080). Needs curl; jq makes the output easier to read.
+# instance; by default it's the port `scripts/dev.sh run` or `docker` last chose, else 8080. Needs
+# curl; jq makes the output easier to read.
 
 set -euo pipefail
 
-BASE="${FILE_UPLOAD_SERVICE_URL:-http://localhost:${SERVER_PORT:-8080}}"
+PORT_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build/dev-port"
+default_port="${SERVER_PORT:-$( [ -f "$PORT_FILE" ] && cat "$PORT_FILE" || echo 8080)}"
+BASE="${FILE_UPLOAD_SERVICE_URL:-http://localhost:$default_port}"
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 show() { if command -v jq >/dev/null 2>&1; then jq .; else cat; echo; fi; }
