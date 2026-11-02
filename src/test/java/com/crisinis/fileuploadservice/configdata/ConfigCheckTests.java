@@ -105,6 +105,8 @@ class ConfigCheckTests {
         ConfigCheck check = check(FakeVault.ROOT_TOKEN, Map.of(
                 "file-upload-service.mode", "production",
                 "file-upload-service.scan.queue-url", "https://sqs.ap-southeast-2.amazonaws.com/123456789012/scan-events",
+                "springdoc.api-docs.enabled", "false",
+                "springdoc.swagger-ui.enabled", "false",
                 "logging.structured.format.console", "ecs"));
         assertThat(check.run().restartable()).isTrue();
 

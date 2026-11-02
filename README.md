@@ -22,6 +22,7 @@ explains it. Keep it current: add a row in the same pull request as the feature.
 | Promotion | Clean files are copied inside S3 to the clean bucket (only the version scanned) and removed from quarantine; infected and unscanned files are never served | [File lifecycle](#file-lifecycle) |
 | Scan tracking | Each file's status with when it landed (GuardDuty picked it up), when the scan finished and the result; scans in progress across all instances (`GET /api/v1/scans`, gauge `scan.in-progress`); overdue scans reported once | [REST API](#rest-api), [Metrics](#metrics) |
 | Download | `GET /api/v1/files/{id}/content` redirects to a 5-minute S3 link for an available file | [REST API](#rest-api) |
+| API documentation | OpenAPI description at `/v3/api-docs` and Swagger UI at `/swagger-ui.html`, generated from the code; off in production (`FILE_UPLOAD_SERVICE_API_DOCS`) | [API documentation](#api-documentation) |
 | Local GuardDuty simulator | On a laptop, invents scan results (the EICAR test string is "infected") so the whole flow runs without AWS; refused in production | [Running locally](#running-locally) |
 | **Configuration and security** | | |
 | Parameter Store and Vault | Settings from AWS SSM Parameter Store and secrets from HashiCorp Vault, read at startup; the instance refuses to start if either can't be read | [Configuration and secrets](#configuration-and-secrets) |
@@ -123,6 +124,7 @@ append it to an image to try that path.
 | GET | `/api/v1/files/{id}` | The file: `status`, `createdAt`, `submittedForScanAt` (landed; GuardDuty picked it up), `scanCompletedAt`, `scanResult`, `availableAt`, `rejectedBecause`, `contentUrl` |
 | GET | `/api/v1/files/{id}/content` | 303 to a 5-minute download link; 409 unless `AVAILABLE` |
 | GET | `/api/v1/scans` | `{inProgress, oldestSubmittedAt, overdueAfter}`: files GuardDuty is scanning now, across all instances |
+| GET | `/v3/api-docs`, `/swagger-ui.html` | The OpenAPI description and Swagger UI ([API documentation](#api-documentation)); not in production |
 | GET | `/actuator/health` | Health, including `s3`, `dynamoDb` and `scanQueue` (not part of readiness) |
 | GET | `/actuator/metrics` | Micrometer meters |
 
@@ -135,6 +137,19 @@ append it to an image to try that path.
 | 413 | Larger than `uploads.max-size` (`TOO_LARGE`) |
 | 415 | Type not accepted (`UNSUPPORTED_TYPE`), or the content isn't the declared type (`CONTENT_MISMATCH`) |
 | 503 | S3 or DynamoDB unavailable (`Retry-After: 5`), or this instance is streaming its maximum (`Retry-After: 1`) |
+
+### API documentation
+
+[springdoc-openapi](https://springdoc.org) generates an OpenAPI 3.1 description of the `/api/**`
+endpoints from the controllers and their `@Operation` annotations:
+
+- `http://localhost:8080/v3/api-docs` (JSON; `/v3/api-docs.yaml` for YAML), for generating clients
+- `http://localhost:8080/swagger-ui.html`, to read the API and try it ("Try it out" works for
+  both upload styles; for the presigned style, the PUT to S3 is a second step outside Swagger UI)
+
+Both are on by default and **refused in production mode** (`FILE_UPLOAD_SERVICE_API_DOCS=false`,
+set in `deploy/k8s/configmap.yaml`); the ingress only routes `/api/` anyway. Keep the annotations
+current when an endpoint changes: `ApiDocumentationTests` checks the essentials.
 
 **Not built yet:** authentication. Every endpoint is open, and any caller can read any file's
 status. Add it (for example JWT bearer tokens, with each file owned by the caller) before exposing
@@ -173,6 +188,7 @@ so a caller can quote it to support.
 | `file-upload-service.aws.s3-endpoint` / `.sqs-endpoint` / `.dynamodb-endpoint` | `FILE_UPLOAD_SERVICE_S3_ENDPOINT` / `_SQS_ENDPOINT` / `_DYNAMODB_ENDPOINT` | blank = AWS; emulators only (refused in production) |
 | `file-upload-service.aws.timeout` | `FILE_UPLOAD_SERVICE_AWS_TIMEOUT` | `10s` per AWS call (a streamed PUT has `stream-timeout`) |
 | `spring.servlet.multipart.enabled` | | `false`: multipart parsing would spool to disk |
+| `springdoc.api-docs.enabled`, `springdoc.swagger-ui.enabled` | `FILE_UPLOAD_SERVICE_API_DOCS` | `true`; must be `false` in production ([API documentation](#api-documentation)) |
 | `logging.structured.format.console` | `FILE_UPLOAD_SERVICE_LOG_FORMAT` | blank = readable text; `ecs` for ECS JSON in production |
 | `logging.structured.ecs.service.environment` | `FILE_UPLOAD_SERVICE_ENVIRONMENT` | `local` |
 
@@ -378,7 +394,8 @@ one item per file:
 
 ```
 com.crisinis.fileuploadservice
-├── config/       settings records, AWS clients (AwsClients, AwsCallMetrics), ProductionSafeguards
+├── config/       settings records, AWS clients (AwsClients, AwsCallMetrics), ProductionSafeguards,
+│                 ApiDocumentation (OpenAPI)
 ├── configdata/   Parameter Store and Vault at startup; ConfigCheck
 ├── logging/      LogEvent catalogue, request ids
 ├── model/        FileRecord, FileType (signatures), FileStatus, ScanResult, UploadMethod

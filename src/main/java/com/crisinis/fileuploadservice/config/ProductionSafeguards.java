@@ -57,6 +57,11 @@ public class ProductionSafeguards {
             violations.add("file-upload-service.scan.queue-url is not set: without GuardDuty's results no upload is "
                     + "ever scanned or promoted (FILE_UPLOAD_SERVICE_SCAN_QUEUE_URL)");
         }
+        if (binder.bind("springdoc.api-docs.enabled", Boolean.class).orElse(true)
+                || binder.bind("springdoc.swagger-ui.enabled", Boolean.class).orElse(true)) {
+            violations.add("springdoc.api-docs.enabled or springdoc.swagger-ui.enabled is on: the API's description "
+                    + "and Swagger UI are for development (FILE_UPLOAD_SERVICE_API_DOCS=false)");
+        }
         if (properties.scan().simulator().enabled()) {
             violations.add("file-upload-service.scan.simulator.enabled is on: it invents scan results instead of "
                     + "GuardDuty's (FILE_UPLOAD_SERVICE_SCAN_SIMULATOR)");
