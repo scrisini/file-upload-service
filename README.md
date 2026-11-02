@@ -62,7 +62,7 @@ flowchart LR
 |---|---|---|
 | **JDK 17+** | Runs Gradle | The build compiles with a **JDK 25 toolchain**, which Gradle downloads automatically if it isn't installed. |
 | **Docker** with Compose v2 | Runs the AWS emulators | S3Mock (S3), ElasticMQ (SQS), DynamoDB Local; all free, no account needed. |
-| **Free ports** 8080, 9099, 9324, 8000 | The app; S3, SQS, DynamoDB | Change the app's with `SERVER_PORT`. |
+| **Free ports** 8080, 9099, 9324, 8000 | The app; S3, SQS, DynamoDB | If 8080 is taken, `run` and `docker` ask for another (or set `SERVER_PORT`). |
 | `curl`, `bash` | Helper script | Preinstalled on macOS and most Linux distributions. |
 | `sops`, `age` | Secrets in git, only if `config/secrets/local.enc.env` exists | `brew install sops age`; see [Secrets in git (SOPS)](#secrets-in-git-sops). |
 
@@ -72,6 +72,7 @@ flowchart LR
 scripts/dev.sh hooks     # once per clone: check commit messages and plaintext secrets before each commit
 scripts/dev.sh check     # verify the prerequisites above
 scripts/dev.sh run       # start dependencies, then the app (Ctrl-C to stop)
+scripts/dev.sh docker    # or: the same, with the app in Docker as it runs in production
 scripts/dev.sh status    # in another terminal
 
 scripts/try-upload.sh presigned photo.jpg   # upload in either style and follow the scan
@@ -91,11 +92,22 @@ append it to an image to try that path.
 | `check` | Checks Java, Docker, free ports, the outbound proxy and external hosts |
 | `infra` | Starts `docker-compose.yml` dependencies and waits until they're healthy |
 | `run [args…]` | `check` + `infra`, then `./gradlew bootRun`; extra args go to Spring Boot |
+| `docker [args…]` | `check` + `infra`, then builds the image (`bootBuildImage`, as production does) and runs it from `docker-compose.yml`'s `app` service, with a read-only filesystem and an in-memory `/tmp` as on Kubernetes; extra args go to Spring Boot |
 | `status` | Shows dependency and app health |
 | `test` | Runs the test suite |
-| `stop` | Stops dependencies; data is kept |
+| `stop` | Stops the app's container (from `docker`) and the dependencies; data is kept |
 | `reset [--yes]` | Removes dependency containers **and their data** (asks first) |
 | `hooks` | Installs the git hooks: commit messages, plaintext secrets |
+
+**The app's port** is `SERVER_PORT`, 8080 by default. If it's taken, `run` and `docker` say what
+holds it and ask for another (Enter takes the next one). They remember the choice in
+`build/dev-port`, where `status` and `scripts/try-upload.sh` find it. Without a terminal to ask,
+they stop and ask for `SERVER_PORT` instead.
+
+**In Docker** the app reaches the emulators by their service names (`http://s3:9090`), but presigned
+URLs go to programs on your machine, so they carry `http://localhost:9099`
+(`FILE_UPLOAD_SERVICE_S3_PRESIGN_ENDPOINT`). The first image build downloads the buildpacks and takes
+a few minutes; later ones take under a minute.
 
 ### Without the script
 
@@ -107,8 +119,8 @@ append it to an image to try that path.
 
 ### Troubleshooting
 
-- **`port 8080 is in use`**: another copy may be running (for example from your IDE); stop it or
-  set `SERVER_PORT` (and `FILE_UPLOAD_SERVICE_URL` for `try-upload.sh`).
+- **`port 8080 is in use`**: another copy may be running (for example from your IDE, or the
+  `docker` container: `scripts/dev.sh stop`). `run` and `docker` offer another port.
 - **Files stay `AWAITING_UPLOAD`**: the app runs without a queue (log [1011](docs/runbook.md#file_upload_service-1011)); start
   it with `scripts/dev.sh run`, which sets one.
 - **`could not create the DynamoDB table`**: DynamoDB Local isn't up; `docker compose ps`.
@@ -186,6 +198,7 @@ so a caller can quote it to support.
 | `file-upload-service.scan.simulator.enabled` / `.delay` | `FILE_UPLOAD_SERVICE_SCAN_SIMULATOR` / `_DELAY` | `false` / `3s`; local only, refused in production |
 | `file-upload-service.aws.region` | `FILE_UPLOAD_SERVICE_AWS_REGION` | blank = the SDK's chain (`AWS_REGION`) |
 | `file-upload-service.aws.s3-endpoint` / `.sqs-endpoint` / `.dynamodb-endpoint` | `FILE_UPLOAD_SERVICE_S3_ENDPOINT` / `_SQS_ENDPOINT` / `_DYNAMODB_ENDPOINT` | blank = AWS; emulators only (refused in production) |
+| `file-upload-service.aws.s3-presign-endpoint` | `FILE_UPLOAD_SERVICE_S3_PRESIGN_ENDPOINT` | blank = `s3-endpoint`; the S3 address in presigned URLs when browsers reach the emulator by another name (the app in Docker); refused in production |
 | `file-upload-service.aws.timeout` | `FILE_UPLOAD_SERVICE_AWS_TIMEOUT` | `10s` per AWS call (a streamed PUT has `stream-timeout`) |
 | `spring.servlet.multipart.enabled` | | `false`: multipart parsing would spool to disk |
 | `springdoc.api-docs.enabled`, `springdoc.swagger-ui.enabled` | `FILE_UPLOAD_SERVICE_API_DOCS` | `true`; must be `false` in production ([API documentation](#api-documentation)) |

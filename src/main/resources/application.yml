@@ -69,6 +69,8 @@ file-upload-service:
   aws:
     region: ${FILE_UPLOAD_SERVICE_AWS_REGION:}
     s3-endpoint: ${FILE_UPLOAD_SERVICE_S3_ENDPOINT:}
+    # the S3 address in presigned URLs, if browsers reach the emulator by another name than the app
+    s3-presign-endpoint: ${FILE_UPLOAD_SERVICE_S3_PRESIGN_ENDPOINT:}
     sqs-endpoint: ${FILE_UPLOAD_SERVICE_SQS_ENDPOINT:}
     dynamodb-endpoint: ${FILE_UPLOAD_SERVICE_DYNAMODB_ENDPOINT:}
     timeout: ${FILE_UPLOAD_SERVICE_AWS_TIMEOUT:10s}

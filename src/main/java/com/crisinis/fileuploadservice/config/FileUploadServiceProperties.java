@@ -94,7 +94,11 @@ public record FileUploadServiceProperties(
      * Parameter Store, not through the outbound proxy.
      *
      * @param region           blank for the SDK's default chain ({@code AWS_REGION})
-     * @param s3Endpoint       override, e.g. a local S3 emulator; blank for AWS. Also the host in presigned URLs
+     * @param s3Endpoint       override, e.g. a local S3 emulator; blank for AWS
+     * @param s3PresignEndpoint the S3 address put in presigned URLs, which callers' browsers use; blank for
+     *                         {@code s3Endpoint}. Differs only when the service reaches the emulator by
+     *                         another name than browsers do (the service in Docker: {@code http://s3:9090}
+     *                         for itself, {@code http://localhost:9099} for browsers)
      * @param sqsEndpoint      override for SQS; blank for AWS
      * @param dynamodbEndpoint override for DynamoDB; blank for AWS
      * @param timeout          limit for each call except a streamed upload's PUT
@@ -102,6 +106,7 @@ public record FileUploadServiceProperties(
     public record Aws(
             @DefaultValue("") String region,
             @DefaultValue("") String s3Endpoint,
+            @DefaultValue("") String s3PresignEndpoint,
             @DefaultValue("") String sqsEndpoint,
             @DefaultValue("") String dynamodbEndpoint,
             @DefaultValue("10s") Duration timeout) {
@@ -109,6 +114,7 @@ public record FileUploadServiceProperties(
         public Aws {
             region = trim(region);
             s3Endpoint = endpoint("s3-endpoint", s3Endpoint);
+            s3PresignEndpoint = endpoint("s3-presign-endpoint", s3PresignEndpoint);
             sqsEndpoint = endpoint("sqs-endpoint", sqsEndpoint);
             dynamodbEndpoint = endpoint("dynamodb-endpoint", dynamodbEndpoint);
             positive("aws.timeout", timeout);
@@ -116,7 +122,13 @@ public record FileUploadServiceProperties(
 
         /** Whether any service is pointed away from AWS (an emulator): never in production. */
         public boolean overridden() {
-            return !s3Endpoint.isEmpty() || !sqsEndpoint.isEmpty() || !dynamodbEndpoint.isEmpty();
+            return !s3Endpoint.isEmpty() || !s3PresignEndpoint.isEmpty() || !sqsEndpoint.isEmpty()
+                    || !dynamodbEndpoint.isEmpty();
+        }
+
+        /** Where presigned URLs point: {@code s3PresignEndpoint}, else {@code s3Endpoint}; blank for AWS. */
+        public String presignEndpoint() {
+            return s3PresignEndpoint.isEmpty() ? s3Endpoint : s3PresignEndpoint;
         }
 
         private static String endpoint(String name, String value) {

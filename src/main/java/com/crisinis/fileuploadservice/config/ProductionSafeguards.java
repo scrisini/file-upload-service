@@ -51,7 +51,7 @@ public class ProductionSafeguards {
         }
         if (properties.aws().overridden()) {
             violations.add("file-upload-service.aws.*-endpoint is set: production talks to AWS itself, not an emulator "
-                    + "(FILE_UPLOAD_SERVICE_S3_ENDPOINT, _SQS_ENDPOINT, _DYNAMODB_ENDPOINT)");
+                    + "(FILE_UPLOAD_SERVICE_S3_ENDPOINT, _S3_PRESIGN_ENDPOINT, _SQS_ENDPOINT, _DYNAMODB_ENDPOINT)");
         }
         if (!properties.scan().enabled()) {
             violations.add("file-upload-service.scan.queue-url is not set: without GuardDuty's results no upload is "

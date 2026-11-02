@@ -38,7 +38,8 @@ promotes clean files. README "File lifecycle" has the states.
 ./gradlew test                 # all tests (offline); must pass before committing
 ./gradlew compileJava          # fast compile check
 scripts/dev.sh check           # verify local prerequisites
-scripts/dev.sh run [args...]   # start dependencies, then the app on :8080; args go to Spring Boot
+scripts/dev.sh run [args...]   # start dependencies, then the app on :8080 (asks if taken); args go to Spring Boot
+scripts/dev.sh docker [args...] # the same with the app in Docker, built as production builds it
 scripts/dev.sh status          # dependency and app health
 scripts/dev.sh hooks           # install the git hooks: commit messages, plaintext secrets (once per clone)
 scripts/test-commit-msg.sh     # test the hook after changing it or .commitlintrc.json
