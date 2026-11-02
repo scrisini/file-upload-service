@@ -341,3 +341,10 @@ BREAKING-CHANGE: <what breaks and how to migrate>
 
 <!-- Gotchas specific to this service: library quirks and workarounds, invariants, operational
      notes. Add to this as you learn them. -->
+
+- **Branch rules aren't enforced by GitHub.** `scrisini/file-upload-service` is a private
+  repository on a free plan, so GitHub refuses rulesets (HTTP 403). `scripts/github-branch-rules.sh
+  --apply` set only the merge settings: squash titled by the PR title with the commit messages,
+  merge commits allowed, rebase off. Follow "Branching and merging" by hand: no direct pushes to
+  `main` or `develop`, squash into `main`, merge commits into `develop`, `commitlint` green before
+  merging. Re-run the script with `--apply` after upgrading to GitHub Pro (or going public).
