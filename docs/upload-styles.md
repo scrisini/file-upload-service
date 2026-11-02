@@ -69,8 +69,8 @@ bodies to temporary files, and the service must not need a filesystem.
 | **Load balancer and ingress** | Not involved in the upload | Carries every byte: ALB data-processing charges; ingress body-size limits (NGINX defaults to 1 MB) must allow `max-size` |
 | **Cost (AWS)** | An S3 PUT request | The same PUT, plus ALB processed bytes, cross-AZ traffic, and pod CPU and network |
 | **Large files** | Up to 5 GB in one PUT; presigned multipart (not built) for more, with resumable parts | One PUT up to 5 GB, limited in practice by `stream-timeout` and the client's connection; no resume |
-| **Retries after a failure** | Re-PUT to the same URL while it's valid (if nothing landed); otherwise ask for a new URL | Upload again from the start |
-| **Abandoned uploads** | The record stays `AWAITING_UPLOAD` until DynamoDB's TTL removes it (URL lifetime + 1 h) | Not possible: the record is created as the bytes arrive |
+| **Retries after a failure** | Ask again with the same `Idempotency-Key`: a fresh URL for the same file while nothing landed, the file itself once it has | Upload again with the same `Idempotency-Key`: the same file, never a second copy; a file that already landed isn't sent twice |
+| **Abandoned uploads** | The record stays `AWAITING_UPLOAD` until DynamoDB's TTL removes it (URL lifetime + 15 days) | Not possible: the record is created as the bytes arrive |
 | **"Picked up for scanning" time** | S3's own time from the Object Created event | The service's clock when its PUT completed |
 | **Progress bar in the browser** | Yes (`XMLHttpRequest.upload.onprogress` against S3) | Yes (the same, against the API) |
 | **Upload speed far from the region** | S3 Transfer Acceleration can be turned on | Through the ALB in the service's region |
@@ -91,18 +91,27 @@ Measure on AWS before deciding on cost or capacity (README "Capacity").
 
 ## Front-end code
 
+Give each file an idempotency key when the user picks it, and send the same key on every retry of
+that file (README "Idempotent retries"): a retry then never creates a second file.
+
+```js
+const key = crypto.randomUUID();                // once per file, reused for its retries
+```
+
 **Presigned:**
 
 ```js
 const res = await fetch('/api/v1/uploads', {
   method: 'POST',
-  headers: {'Content-Type': 'application/json'},
+  headers: {'Content-Type': 'application/json', 'Idempotency-Key': key},
   body: JSON.stringify({fileName: file.name, contentType: file.type, size: file.size}),
 });
 if (!res.ok) throw await res.json();            // RFC 9457 problem: detail, reason
 const {file: record, upload} = await res.json();
-const put = await fetch(upload.url, {method: upload.method, headers: upload.headers, body: file});
-if (!put.ok) throw new Error(`S3 refused the upload: ${put.status}`);  // 403 changed headers, 412 twice
+if (upload) {                                   // absent if a retry finds the bytes already landed
+  const put = await fetch(upload.url, {method: upload.method, headers: upload.headers, body: file});
+  if (!put.ok && put.status !== 412) throw new Error(`S3 refused the upload: ${put.status}`);  // 412: already there
+}
 // then poll GET /api/v1/files/{record.id} until status is AVAILABLE, INFECTED, REJECTED or NOT_SCANNED
 ```
 
@@ -111,7 +120,7 @@ if (!put.ok) throw new Error(`S3 refused the upload: ${put.status}`);  // 403 ch
 ```js
 const res = await fetch(`/api/v1/files?fileName=${encodeURIComponent(file.name)}`, {
   method: 'POST',
-  headers: {'Content-Type': file.type},            // the browser sets Content-Length from the file
+  headers: {'Content-Type': file.type, 'Idempotency-Key': key},  // the browser sets Content-Length
   body: file,
 });
 if (!res.ok) throw await res.json();            // 411, 413, 415 with a reason, or 503: retry

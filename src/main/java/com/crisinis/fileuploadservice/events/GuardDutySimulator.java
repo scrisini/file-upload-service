@@ -25,7 +25,8 @@ import tools.jackson.databind.json.JsonMapper;
  * S3's EventBridge notifications and GuardDuty, which no local emulator offers. It watches the
  * quarantine bucket and puts the same events on the scan queue that AWS would: "Object Created" when
  * an upload appears, then a scan result {@code scan.simulator.delay} later. A file containing the
- * EICAR test string is reported {@code THREATS_FOUND}; anything else {@code NO_THREATS_FOUND}.
+ * EICAR test string is reported {@code THREATS_FOUND}; anything else {@code NO_THREATS_FOUND}. Like
+ * GuardDuty with tagging on, it also tags the object with its result.
  *
  * <p>Keeps what it has reported in memory, which is fine for one developer's instance and is why it
  * must never run in production.
@@ -114,6 +115,8 @@ public class GuardDutySimulator {
         String id = object.key().substring(properties.storage().quarantinePrefix().length());
         boolean infected = storage.readAll(id).map(GuardDutySimulator::containsEicar).orElse(false);
         ScanResult result = infected ? ScanResult.THREATS_FOUND : ScanResult.NO_THREATS_FOUND;
+        // GuardDuty tags the object with its result before publishing the event
+        storage.tagScanStatus(id, result.name());
         Map<String, Object> details = new LinkedHashMap<>();
         details.put("scanResultStatus", result.name());
         details.put("threats", infected ? List.of(Map.of("name", "EICAR-Test-File (not a virus)")) : null);

@@ -6,6 +6,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import com.crisinis.fileuploadservice.config.FileUploadServiceProperties;
 import com.crisinis.fileuploadservice.logging.LogEvent;
+import com.crisinis.fileuploadservice.model.FileStatus;
 import com.crisinis.fileuploadservice.model.ScanSummary;
 import com.crisinis.fileuploadservice.persistence.FileRepository;
 import io.micrometer.core.instrument.Counter;
@@ -66,7 +67,7 @@ public class ScanMonitor {
     }
 
     private void reportOverdue(Instant now) {
-        for (String id : files.scanningSince(now.minus(scan.overdueAfter()), OVERDUE_BATCH)) {
+        for (String id : files.inStageSince(FileStatus.SCANNING, now.minus(scan.overdueAfter()), OVERDUE_BATCH)) {
             if (files.claimOverdueReport(id, now)) {
                 overdue.increment();
                 LogEvent.SCAN_OVERDUE.at(log).with("file_id", id)

@@ -28,7 +28,7 @@ import com.crisinis.fileuploadservice.service.UnknownFileException;
 import com.crisinis.fileuploadservice.service.UploadCapacityExceededException;
 import com.crisinis.fileuploadservice.service.UploadRejectedException;
 import com.crisinis.fileuploadservice.service.UploadService;
-import com.crisinis.fileuploadservice.service.UploadTicket;
+import com.crisinis.fileuploadservice.service.UploadResult;
 import com.crisinis.fileuploadservice.storage.PresignedUpload;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -58,15 +58,15 @@ class FileControllerTests {
         return new FileRecord(ID, "beach.png", FileType.PNG, 1234, UploadMethod.PRESIGNED_URL, status, T0,
                 status == FileStatus.AWAITING_UPLOAD ? null : T0.plusSeconds(2),
                 result == null ? null : T0.plusSeconds(20),
-                status == FileStatus.AVAILABLE ? T0.plusSeconds(21) : null, result, reason);
+                status == FileStatus.AVAILABLE ? T0.plusSeconds(21) : null, result, reason, null);
     }
 
     @Test
     void presignedStyleReturnsWhereToPutTheFile() throws Exception {
-        when(uploads.requestUpload("beach.png", "image/png", 1234)).thenReturn(new UploadTicket(
+        when(uploads.requestUpload("beach.png", "image/png", 1234, java.util.Optional.empty())).thenReturn(new UploadResult(
                 file(FileStatus.AWAITING_UPLOAD, null, null),
                 new PresignedUpload(URI.create("https://file-upload-quarantine.s3.amazonaws.com/uploads/" + ID + "?X-Amz-Signature=x"),
-                        Map.of("Content-Type", "image/png", "If-None-Match", "*"), T0.plus(Duration.ofMinutes(15)))));
+                        Map.of("Content-Type", "image/png", "If-None-Match", "*"), T0.plus(Duration.ofMinutes(15))), false));
 
         mvc.perform(post("/api/v1/uploads").contentType(MediaType.APPLICATION_JSON)
                         .content("{\"fileName\":\"beach.png\",\"contentType\":\"image/png\",\"size\":1234}"))
@@ -83,6 +83,34 @@ class FileControllerTests {
     }
 
     @Test
+    void aRetryWithTheSameKeyIsMarkedReplayedAndOmitsTheUrlOnceLanded() throws Exception {
+        var key = new com.crisinis.fileuploadservice.model.IdempotencyKey("7c9e6679-7425-40de-944b-e07fc1f90ae7");
+        when(uploads.requestUpload("beach.png", "image/png", 1234, java.util.Optional.of(key)))
+                .thenReturn(new UploadResult(file(FileStatus.SCANNING, null, null), null, true));
+
+        mvc.perform(post("/api/v1/uploads").contentType(MediaType.APPLICATION_JSON)
+                        .header("Idempotency-Key", key.value())
+                        .content("{\"fileName\":\"beach.png\",\"contentType\":\"image/png\",\"size\":1234}"))
+                .andExpect(status().isCreated())
+                .andExpect(header().string("Idempotent-Replayed", "true"))
+                .andExpect(jsonPath("$.file.status").value("SCANNING"))
+                .andExpect(jsonPath("$.upload").doesNotExist());
+    }
+
+    @Test
+    void anInvalidKeyIsABadRequestAndAReusedOneUnprocessable() throws Exception {
+        mvc.perform(post("/api/v1/files").header("Idempotency-Key", "not valid!").contentType("image/png").content(new byte[] {1}))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.detail").value(org.hamcrest.Matchers.containsString("Idempotency-Key")));
+
+        when(uploads.stream(any(), any(), anyLong(), any(), any())).thenThrow(new UploadRejectedException(
+                UploadRejectedException.Reason.IDEMPOTENCY_KEY_REUSED, "used for another file"));
+        mvc.perform(post("/api/v1/files").header("Idempotency-Key", "k-1").contentType("image/png").content(new byte[] {1}))
+                .andExpect(status().isUnprocessableContent())
+                .andExpect(jsonPath("$.reason").value("IDEMPOTENCY_KEY_REUSED"));
+    }
+
+    @Test
     void presignedStyleNeedsTheSize() throws Exception {
         mvc.perform(post("/api/v1/uploads").contentType(MediaType.APPLICATION_JSON)
                         .content("{\"fileName\":\"beach.png\",\"contentType\":\"image/png\"}"))
@@ -93,19 +121,20 @@ class FileControllerTests {
     @Test
     void streamStyleTakesTheFileAsTheBody() throws Exception {
         byte[] body = {(byte) 0x89, 'P', 'N', 'G'};
-        when(uploads.stream(eq("beach.png"), eq("image/png"), eq(4L), any()))
-                .thenReturn(file(FileStatus.SCANNING, null, null));
+        when(uploads.stream(eq("beach.png"), eq("image/png"), eq(4L), any(), any()))
+                .thenReturn(new UploadResult(file(FileStatus.SCANNING, null, null), null, false));
 
         mvc.perform(post("/api/v1/files").param("fileName", "beach.png").contentType("image/png").content(body))
                 .andExpect(status().isAccepted())
                 .andExpect(header().string("Location", "/api/v1/files/" + ID))
+                .andExpect(header().string("Idempotent-Replayed", "false"))
                 .andExpect(jsonPath("$.status").value("SCANNING"))
                 .andExpect(jsonPath("$.submittedForScanAt").value("2026-11-02T10:00:02Z"));
     }
 
     @Test
     void aRefusedUploadSaysWhyWithItsStatus() throws Exception {
-        when(uploads.stream(any(), any(), anyLong(), any())).thenThrow(new UploadRejectedException(
+        when(uploads.stream(any(), any(), anyLong(), any(), any())).thenThrow(new UploadRejectedException(
                 UploadRejectedException.Reason.CONTENT_MISMATCH, "the content is not image/png"));
 
         mvc.perform(post("/api/v1/files").contentType("image/png").content(new byte[] {'M', 'Z'}))
@@ -117,7 +146,7 @@ class FileControllerTests {
 
     @Test
     void aBusyInstanceAsksTheCallerToRetry() throws Exception {
-        when(uploads.stream(any(), any(), anyLong(), any())).thenThrow(new UploadCapacityExceededException(64));
+        when(uploads.stream(any(), any(), anyLong(), any(), any())).thenThrow(new UploadCapacityExceededException(64));
 
         mvc.perform(post("/api/v1/files").contentType("image/png").content(new byte[] {1}))
                 .andExpect(status().isServiceUnavailable())
@@ -189,7 +218,7 @@ class FileControllerTests {
 
     @Test
     void multipartIsRefusedWithoutBeingParsed() throws Exception {
-        when(uploads.stream(any(), eq("multipart/form-data; boundary=x"), anyLong(), any()))
+        when(uploads.stream(any(), eq("multipart/form-data; boundary=x"), anyLong(), any(), any()))
                 .thenThrow(new UploadRejectedException(UploadRejectedException.Reason.UNSUPPORTED_TYPE, "not accepted"));
 
         mvc.perform(post("/api/v1/files").contentType("multipart/form-data; boundary=x").content("--x--"))

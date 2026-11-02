@@ -95,6 +95,10 @@ file-upload-service:
     consumers: ${FILE_UPLOAD_SERVICE_SCAN_CONSUMERS:2}
     overdue-after: ${FILE_UPLOAD_SERVICE_SCAN_OVERDUE_AFTER:5m}
     monitor-interval: ${FILE_UPLOAD_SERVICE_SCAN_MONITOR_INTERVAL:15s}
+    # Finishes files a crash left in flight (README "Crash safety"): promotions PROMOTING longer than
+    # resume-promotion-after, and overdue scans whose result is on the object's GuardDuty tag
+    recovery-interval: ${FILE_UPLOAD_SERVICE_SCAN_RECOVERY_INTERVAL:1m}
+    resume-promotion-after: ${FILE_UPLOAD_SERVICE_SCAN_RESUME_PROMOTION_AFTER:2m}
     # Local stand-in for GuardDuty (scripts/dev.sh turns it on); production refuses it
     simulator:
       enabled: ${FILE_UPLOAD_SERVICE_SCAN_SIMULATOR:false}

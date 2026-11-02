@@ -20,6 +20,9 @@ explains it. Keep it current: add a row in the same pull request as the feature.
 | Accepted files | JPEG, PNG, GIF, WebP, HEIC, TIFF and PDF up to 25 MB (`uploads.allowed-types`, `uploads.max-size`); the declared type and the content's signature must agree | [File lifecycle](#file-lifecycle) |
 | Malware scanning | GuardDuty Malware Protection for S3 scans every upload in the quarantine bucket; results arrive through EventBridge and SQS | [File lifecycle](#file-lifecycle), [AWS resources](docs/deployment.md#aws-resources) |
 | Promotion | Clean files are copied inside S3 to the clean bucket (only the version scanned) and removed from quarantine; infected and unscanned files are never served | [File lifecycle](#file-lifecycle) |
+| Crash safety | A kill or crash at any point leaves a state another instance finishes: events are redelivered, and a recovery job resumes interrupted promotions and applies results from GuardDuty's object tags | [Crash safety](#crash-safety) |
+| Idempotent retries | An `Idempotency-Key` header makes a retried upload return the file its first attempt created, so a lost answer never produces a second copy; concurrent duplicates store one file | [Idempotent retries](#idempotent-retries) |
+| Test scenarios | Every behaviour as a test scenario with steps and expected results, for testers | [`docs/test-scenarios.md`](docs/test-scenarios.md) |
 | Scan tracking | Each file's status with when it landed (GuardDuty picked it up), when the scan finished and the result; scans in progress across all instances (`GET /api/v1/scans`, gauge `scan.in-progress`); overdue scans reported once | [REST API](#rest-api), [Metrics](#metrics) |
 | Download | `GET /api/v1/files/{id}/content` redirects to a 5-minute S3 link for an available file | [REST API](#rest-api) |
 | API documentation | OpenAPI description at `/v3/api-docs` and Swagger UI at `/swagger-ui.html`, generated from the code; off in production (`FILE_UPLOAD_SERVICE_API_DOCS`) | [API documentation](#api-documentation) |
@@ -76,7 +79,8 @@ scripts/dev.sh docker    # or: the same, with the app in Docker as it runs in pr
 scripts/dev.sh status    # in another terminal
 
 scripts/try-upload.sh presigned photo.jpg   # upload in either style and follow the scan
-scripts/try-upload.sh stream report.pdf
+scripts/try-upload.sh stream report.pdf     # (IDEMPOTENCY_KEY=<printed key> replays an upload)
+scripts/send-scan-event.sh result <id> UNSUPPORTED PASSWORD_PROTECTED   # inject S3/GuardDuty events
 ```
 
 `run` points the app at the emulators and turns on the **GuardDuty simulator**: no emulator offers
@@ -124,6 +128,10 @@ a few minutes; later ones take under a minute.
 - **Files stay `AWAITING_UPLOAD`**: the app runs without a queue (log [1011](docs/runbook.md#file_upload_service-1011)); start
   it with `scripts/dev.sh run`, which sets one.
 - **`could not create the DynamoDB table`**: DynamoDB Local isn't up; `docker compose ps`.
+- **Testing:** [`docs/test-scenarios.md`](docs/test-scenarios.md) lists every scenario with steps and
+  expected results. `scripts/send-scan-event.sh` (with `FILE_UPLOAD_SERVICE_SCAN_SIMULATOR=false`)
+  injects what the simulator never sends: unscannable results, duplicate and reordered events,
+  garbage, and GuardDuty tags without events.
 - The emulators don't check signatures, so a presigned PUT with wrong headers succeeds locally
   where S3 would answer 403. `FileStorageTests` checks what is signed.
 
@@ -148,7 +156,29 @@ a few minutes; later ones take under a minute.
 | 411 | Streamed without `Content-Length` |
 | 413 | Larger than `uploads.max-size` (`TOO_LARGE`) |
 | 415 | Type not accepted (`UNSUPPORTED_TYPE`), or the content isn't the declared type (`CONTENT_MISMATCH`) |
+| 422 | The `Idempotency-Key` was used for another file (`IDEMPOTENCY_KEY_REUSED`) |
 | 503 | S3 or DynamoDB unavailable (`Retry-After: 5`), or this instance is streaming its maximum (`Retry-After: 1`) |
+
+### Idempotent retries
+
+An upload's answer can be lost (a timeout, a dropped connection, a crash) after the file was
+created or even stored. Without help the caller can't tell, and its retry makes a second file. So
+both upload endpoints take an optional **`Idempotency-Key`** header: a value unique to the file (a
+UUID; 1–128 letters, digits or `- _ . :`), generated when the user picks the file and **sent again
+on every retry** of that file.
+
+- The key decides the file's id, so every attempt with it works on the same record and S3 object.
+- A retry is answered with the file the first attempt created, with **`Idempotent-Replayed: true`**
+  (otherwise `false`) and the same status code. Its status says how far it got.
+- **Presigned:** a retry before the bytes landed gets a fresh URL for the same file; after, no
+  `upload` at all. **Stream:** a retry of a file that landed isn't read or stored again; a retry
+  after an attempt that died midway stores the file, under the same id.
+- Concurrent attempts with one key store one file (`If-None-Match: *` lets one PUT win).
+- The key binds the file's name, type, size and upload style: reusing it for anything else is
+  refused with **422** `IDEMPOTENCY_KEY_REUSED`. Refused uploads (4xx) create nothing, so retrying
+  them gives the same refusal.
+- A key stays bound as long as the file's record exists. Once authentication exists, keys should
+  be scoped to the caller.
 
 ### API documentation
 
@@ -195,6 +225,8 @@ so a caller can quote it to support.
 | `file-upload-service.scan.consumers` | `FILE_UPLOAD_SERVICE_SCAN_CONSUMERS` | `2` receiving threads per instance |
 | `file-upload-service.scan.overdue-after` | `FILE_UPLOAD_SERVICE_SCAN_OVERDUE_AFTER` | `5m`, then the scan is reported ([2009](docs/runbook.md#file_upload_service-2009)) |
 | `file-upload-service.scan.monitor-interval` | `FILE_UPLOAD_SERVICE_SCAN_MONITOR_INTERVAL` | `15s` between counts of scans in progress |
+| `file-upload-service.scan.recovery-interval` | `FILE_UPLOAD_SERVICE_SCAN_RECOVERY_INTERVAL` | `1m` between runs of [crash recovery](#crash-safety) |
+| `file-upload-service.scan.resume-promotion-after` | `FILE_UPLOAD_SERVICE_SCAN_RESUME_PROMOTION_AFTER` | `2m`: a file `PROMOTING` this long is finished by recovery |
 | `file-upload-service.scan.simulator.enabled` / `.delay` | `FILE_UPLOAD_SERVICE_SCAN_SIMULATOR` / `_DELAY` | `false` / `3s`; local only, refused in production |
 | `file-upload-service.aws.region` | `FILE_UPLOAD_SERVICE_AWS_REGION` | blank = the SDK's chain (`AWS_REGION`) |
 | `file-upload-service.aws.s3-endpoint` / `.sqs-endpoint` / `.dynamodb-endpoint` | `FILE_UPLOAD_SERVICE_S3_ENDPOINT` / `_SQS_ENDPOINT` / `_DYNAMODB_ENDPOINT` | blank = AWS; emulators only (refused in production) |
@@ -354,6 +386,7 @@ Logs are built for production support and log processors (ELK, Splunk, New Relic
 | `file-upload-service.files.time-to-available` | timer, p50/p95/p99 | `method`: from landing to available, what callers wait |
 | `file-upload-service.events.wait` | timer, p50/p95/p99 | time an event waited in SQS before the service took it (queue backlog) |
 | `file-upload-service.events` | counter | `outcome` (`handled`, `failed`, `unrecognised`, `unknown_file`) |
+| `file-upload-service.recovery` | counter | `action` (`promotion_resumed`, `result_from_tag`): files [crash recovery](#crash-safety) finished |
 | `file-upload-service.aws.requests` | timer, p50/p95/p99 | `service`, `operation`, `outcome`: every AWS call with its retries; SQS `ReceiveMessage` includes its long-poll wait |
 
 Every meter is also tagged `mode`. Work that passes through a queue or an asynchronous stage
@@ -387,6 +420,34 @@ stateDiagram-v2
 - Infected and unscanned files stay in quarantine, are never served, and expire after 30 days
   (bucket lifecycle rule). An unscanned file counts as unsafe.
 
+### Crash safety
+
+A file's state must stay right whatever stops the service: a deploy, a crash, `kill -9`, an
+out-of-memory kill, a lost node. No step relies on memory. Each store is atomic on its own (an S3
+PUT or copy, a DynamoDB conditional update, an SQS delete), and every multi-step change is
+**idempotent and resumable**: the record says what's done, so any instance can finish what a dead
+one started.
+
+| The process dies… | State left | What finishes it |
+|---|---|---|
+| after issuing a presigned URL | `AWAITING_UPLOAD`, no object | The caller's PUT goes to S3 directly; its event marks the file. Unused: TTL removes the record |
+| while streaming an upload | `AWAITING_UPLOAD`; **no object** (S3 PUTs are all or nothing) | The caller sees the connection fail and uploads again; TTL removes the record |
+| after S3 stored a streamed file, before its status was updated | `AWAITING_UPLOAD`, object in quarantine | S3's "Object Created" event marks it `SCANNING` (on any instance) |
+| while GuardDuty scans (or for hours) | `SCANNING` | GuardDuty runs without the service; results wait in SQS (4 days). Records outlive them (TTL 15 days) |
+| holding an event it hadn't finished | Event invisible in SQS | SQS delivers it again after 60 s; repeating any step changes nothing |
+| mid-promotion (after the result, before or after the copy or delete) | `PROMOTING`, the scanned ETag stored | The event's redelivery, or the recovery job after 2 minutes ([2010](docs/runbook.md#file_upload_service-2010)) |
+| repeatedly, until events go to the dead-letter queue | `SCANNING` or `PROMOTING` | The recovery job: promotions from the record; results from GuardDuty's object tag ([2011](docs/runbook.md#file_upload_service-2011)) |
+
+| after storing an upload, before answering the caller | The file, in whatever state | The caller retries with the same [`Idempotency-Key`](#idempotent-retries) and gets that file, not a second one |
+
+**Records are never deleted by the service**, even when an upload fails: an event or a retry for
+the same id may still be on its way. DynamoDB's TTL removes the ones whose upload never landed.
+
+Measured by killing the app with `kill -9` at each of these points against the local stack, and by
+racing retries and concurrent duplicates: every file ended in the right status, nothing was stored
+or promoted twice, and no object was left without a record. The scenarios are in
+[`docs/test-scenarios.md`](docs/test-scenarios.md) ("CR" and "ID").
+
 ## Data
 
 DynamoDB table `file-upload-service-files` ([`deploy/aws/dynamodb-table.json`](deploy/aws/dynamodb-table.json)),
@@ -399,8 +460,9 @@ one item per file:
 | `status` | S | [File lifecycle](#file-lifecycle) |
 | `createdAt`, `submittedAt`, `scannedAt`, `availableAt` | N | Epoch milliseconds of each step |
 | `scanResult`, `reason` | S | GuardDuty's result; the threat, GuardDuty's reasons or the rejection (support only) |
-| `scanQueue` | S | `SCANNING` while scanning, else absent: puts the item in the sparse `scanning` index (`scanQueue`, `submittedAt`), which the count and the overdue check read |
-| `expiresAt` | N | Epoch seconds; DynamoDB's TTL deletes a record whose upload never came. Removed once it lands |
+| `stage`, `stageSince` | S, N | `SCANNING` or `PROMOTING` and when it began, while the file is in flight; absent otherwise. They put the item in the sparse `in-flight` index, which the scan count, the overdue check and [crash recovery](#crash-safety) read |
+| `scannedETag` | S | The version GuardDuty scanned: promotion copies only that version, and a promotion a crash interrupted resumes with it |
+| `expiresAt` | N | Epoch seconds; DynamoDB's TTL deletes a record whose upload never came, 15 days after its URL expires (longer than any of its events can wait in SQS). Removed once the file lands |
 | `overdueReportedAt` | N | Set by the one instance that reported the scan overdue |
 
 ## Layout
@@ -412,9 +474,10 @@ com.crisinis.fileuploadservice
 ├── configdata/   Parameter Store and Vault at startup; ConfigCheck
 ├── logging/      LogEvent catalogue, request ids
 ├── model/        FileRecord, FileType (signatures), FileStatus, ScanResult, UploadMethod
-├── service/      UploadService (both styles), ScanOutcomes (events → status, promotion), ScanMonitor
+├── service/      UploadService (both styles), ScanOutcomes (events → status, promotion), ScanMonitor,
+│                 InFlightRecovery (finishes files a crash left in flight)
 ├── storage/      FileStorage: S3 presigning, streaming, promotion
-├── persistence/  FileRepository: DynamoDB records and the scanning index
+├── persistence/  FileRepository: DynamoDB records and the in-flight index
 ├── events/       SQS consumer, EventBridge event parser, the local GuardDuty simulator
 └── web/          FileController, FileView, ApiExceptionHandler, RequestIdFilter
 ```
@@ -469,7 +532,9 @@ request as the change.
 | Content checked by signature, after the scan for presigned | The service never sees presigned bytes; reading 16 bytes from S3 at promotion is cheap | A wrong file is refused only after its scan |
 | Events through EventBridge → SQS, not S3 notifications to the service | SQS shares work across instances, retries and dead-letters; EventBridge carries both S3's and GuardDuty's events | Two more resources to deploy |
 | "Picked up" = S3's Object Created time | GuardDuty publishes no scan-start event and scans on arrival | Not GuardDuty's own start time |
-| Count of scans from a sparse index | Reads only files in flight, not the table | One partition key: about 1,000 status changes a second before it needs sharding |
+| Count of scans from a sparse index | Reads only files in flight, not the table | One partition key per stage: about 1,000 status changes a second before it needs sharding |
+| Recovery from stored state, not only redelivery | A file must not be stranded when its event is dead-lettered or lost; the record holds the scanned ETag and GuardDuty's tag holds its result | A scheduled job on every instance; GuardDuty tagging must be on |
+| Records kept 15 days before TTL | Longer than SQS (4 days) and its dead-letter queue (14) can hold an upload's event, so no event finds its record gone | Abandoned uploads' records linger 15 days (a few hundred bytes each) |
 | Copy inside S3 to promote | No bytes through the service; one request | Single-request copy limits files to 5 GB (`max-size` enforces it) |
 | A GuardDuty simulator in the service | No emulator offers GuardDuty or EventBridge; the demo runs end to end on a laptop | Code that must never run in production (refused by production mode) |
 | REST only, no gRPC API | Clients upload files over HTTP; one protocol, one port, one ALB target group | Clients that want gRPC call the REST API instead |
@@ -502,8 +567,10 @@ Manager (single PUTs and copies suffice at 25 MB).
 - **Per status read:** one consistent DynamoDB `GetItem`.
 - **Per event:** one conditional `UpdateItem`; for a clean file, a 16-byte ranged `GetObject`, a
   `CopyObject`, a `DeleteObject` and an `UpdateItem`.
-- **Per monitor run (each instance, every 15 s):** a `COUNT` query over the scanning index; cost
+- **Per monitor run (each instance, every 15 s):** a `COUNT` query over the in-flight index; cost
   grows with scans in flight, not with the table.
+- **Per recovery run (each instance, every minute):** two index queries; for each file found (none
+  normally), a `GetItem` or a `GetObjectTagging`, then the usual promotion calls.
 - Meters are registered once (enum maps); no per-event registration.
 
 ## Contributing

@@ -27,6 +27,7 @@ import java.util.concurrent.TimeUnit;
 import com.crisinis.fileuploadservice.model.FileRecord;
 import com.crisinis.fileuploadservice.model.FileStatus;
 import com.crisinis.fileuploadservice.model.FileType;
+import com.crisinis.fileuploadservice.model.IdempotencyKey;
 import com.crisinis.fileuploadservice.model.UploadMethod;
 import com.crisinis.fileuploadservice.persistence.FileRepository;
 import com.crisinis.fileuploadservice.service.UploadRejectedException.Reason;
@@ -46,6 +47,12 @@ class UploadServiceTests {
     private final FileStorage storage = mock(FileStorage.class);
     private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
     private final UploadService uploads = service(Map.of());
+    static final Optional<IdempotencyKey> NO_KEY = Optional.empty();
+
+    @org.junit.jupiter.api.BeforeEach
+    void recordsAreNew() {
+        when(files.createIfAbsent(any())).thenAnswer(call -> new FileRepository.Update(true, call.getArgument(0)));
+    }
 
     private UploadService service(Map<String, String> settings) {
         return new UploadService(files, storage, TestProperties.of(settings), Clock.fixed(NOW, ZoneOffset.UTC), registry);
@@ -57,10 +64,10 @@ class UploadServiceTests {
                 Map.of("Content-Type", "image/png"), NOW.plus(Duration.ofMinutes(15)));
         when(storage.presignUpload(any(), eq(FileType.PNG), eq(1234L), eq(Duration.ofMinutes(15)))).thenReturn(presigned);
 
-        UploadTicket ticket = uploads.requestUpload("../holiday/beach.png", "image/png", 1234);
+        UploadResult ticket = uploads.requestUpload("../holiday/beach.png", "image/png", 1234, NO_KEY);
 
         ArgumentCaptor<FileRecord> created = ArgumentCaptor.forClass(FileRecord.class);
-        verify(files).create(created.capture());
+        verify(files).createIfAbsent(created.capture());
         assertThat(created.getValue()).satisfies(file -> {
             assertThat(file.fileName()).isEqualTo("beach.png");
             assertThat(file.status()).isEqualTo(FileStatus.AWAITING_UPLOAD);
@@ -74,13 +81,13 @@ class UploadServiceTests {
 
     @Test
     void refusesTypesSizesAndNamesBeforeIssuingAnything() {
-        assertRejected(() -> uploads.requestUpload("a.svg", "image/svg+xml", 10), Reason.UNSUPPORTED_TYPE);
-        assertRejected(() -> uploads.requestUpload("a.png", "image/png", 0), Reason.INVALID);
-        assertRejected(() -> uploads.requestUpload("a.png", "image/png", 25L * 1024 * 1024 + 1), Reason.TOO_LARGE);
+        assertRejected(() -> uploads.requestUpload("a.svg", "image/svg+xml", 10, NO_KEY), Reason.UNSUPPORTED_TYPE);
+        assertRejected(() -> uploads.requestUpload("a.png", "image/png", 0, NO_KEY), Reason.INVALID);
+        assertRejected(() -> uploads.requestUpload("a.png", "image/png", 25L * 1024 * 1024 + 1, NO_KEY), Reason.TOO_LARGE);
         assertRejected(() -> service(Map.of("file-upload-service.uploads.allowed-types", "PDF"))
-                .requestUpload("a.png", "image/png", 10), Reason.UNSUPPORTED_TYPE);
+                .requestUpload("a.png", "image/png", 10, NO_KEY), Reason.UNSUPPORTED_TYPE);
 
-        verify(files, never()).create(any());
+        verify(files, never()).createIfAbsent(any());
         verify(storage, never()).presignUpload(any(), any(), anyLong(), any());
     }
 
@@ -88,14 +95,14 @@ class UploadServiceTests {
     void streamsAMatchingFileAndMarksItSubmitted() throws IOException {
         when(files.markSubmitted(any(), eq(NOW))).thenAnswer(call -> Optional.of(new FileRepository.Update(true,
                 new FileRecord(call.getArgument(0), "a.png", FileType.PNG, PNG.length, UploadMethod.STREAM,
-                        FileStatus.SCANNING, NOW, NOW, null, null, null, null))));
+                        FileStatus.SCANNING, NOW, NOW, null, null, null, null, null))));
         byte[][] stored = new byte[1][];
         doAnswer(call -> {
             stored[0] = call.<InputStream>getArgument(3).readAllBytes();
             return null;
         }).when(storage).store(any(), eq(FileType.PNG), eq((long) PNG.length), any());
 
-        FileRecord file = uploads.stream("a.png", "image/png", PNG.length, new ByteArrayInputStream(PNG));
+        FileRecord file = uploads.stream("a.png", "image/png", PNG.length, new ByteArrayInputStream(PNG), NO_KEY).file();
 
         assertThat(file.status()).isEqualTo(FileStatus.SCANNING);
         assertThat(stored[0]).as("the signature read for checking is sent on too").isEqualTo(PNG);
@@ -107,42 +114,56 @@ class UploadServiceTests {
     void refusesAStreamWhoseContentIsNotTheDeclaredTypeBeforeStoringIt() {
         byte[] executable = "MZ\u0090\u0000 this is not a png at all".getBytes();
 
-        assertThatThrownBy(() -> uploads.stream("a.png", "image/png", executable.length, new ByteArrayInputStream(executable)))
+        assertThatThrownBy(() -> uploads.stream("a.png", "image/png", executable.length, new ByteArrayInputStream(executable), NO_KEY))
                 .isInstanceOfSatisfying(UploadRejectedException.class, e -> {
                     assertThat(e.reason()).isEqualTo(Reason.CONTENT_MISMATCH);
                     assertThat(e.getMessage()).isEqualTo("the content is not image/png");
                 });
-        verify(files, never()).create(any());
+        verify(files, never()).createIfAbsent(any());
         verify(storage, never()).store(any(), any(), anyLong(), any());
     }
 
     @Test
     void needsALengthAndKeepsToTheLimit() {
-        assertRejected(() -> uploads.stream("a.png", "image/png", -1, InputStream.nullInputStream()), Reason.LENGTH_REQUIRED);
-        assertRejected(() -> uploads.stream("a.png", "image/png", 26L * 1024 * 1024, InputStream.nullInputStream()),
+        assertRejected(() -> uploads.stream("a.png", "image/png", -1, InputStream.nullInputStream(), NO_KEY), Reason.LENGTH_REQUIRED);
+        assertRejected(() -> uploads.stream("a.png", "image/png", 26L * 1024 * 1024, InputStream.nullInputStream(), NO_KEY),
                 Reason.TOO_LARGE);
     }
 
     @Test
-    void aBodyShorterThanItsLengthIsTheCallersFaultAndLeavesNoRecord() {
+    void aBodyShorterThanItsLengthIsTheCallersFault() {
         doAnswer(call -> {
             call.<InputStream>getArgument(3).readAllBytes();
             throw new DependencyUnavailableException("s3", "PutObject", new IOException("stream ended"));
         }).when(storage).store(any(), any(), anyLong(), any());
 
-        assertRejected(() -> uploads.stream("a.png", "image/png", 1000, new ByteArrayInputStream(PNG)), Reason.INCOMPLETE);
-        verify(files).delete(any());
+        assertRejected(() -> uploads.stream("a.png", "image/png", 1000, new ByteArrayInputStream(PNG), NO_KEY), Reason.INCOMPLETE);
+        // kept: a retry with the same key may be using it; DynamoDB's TTL removes it
     }
 
     @Test
-    void anS3FailureIsADependencyFailureAndLeavesNoRecord() {
+    void anS3FailureKeepsTheRecordInCaseS3StoredTheFileAndOnlyItsAnswerWasLost() {
         doAnswer(call -> {
-            throw new DependencyUnavailableException("s3", "PutObject", new IOException("connection refused"));
+            call.<InputStream>getArgument(3).readAllBytes();
+            throw new DependencyUnavailableException("s3", "PutObject", new IOException("read timed out"));
         }).when(storage).store(any(), any(), anyLong(), any());
 
-        assertThatThrownBy(() -> uploads.stream("a.png", "image/png", PNG.length, new ByteArrayInputStream(PNG)))
+        assertThatThrownBy(() -> uploads.stream("a.png", "image/png", PNG.length, new ByteArrayInputStream(PNG), NO_KEY))
                 .isInstanceOf(DependencyUnavailableException.class);
-        verify(files).delete(any());
+        // nothing deletes it: its Object Created event (if it landed) finds it; DynamoDB's TTL removes it otherwise
+    }
+
+    @Test
+    void aStoredFileIsAcceptedEvenIfItsStatusCantBeUpdated() {
+        when(files.markSubmitted(any(), any()))
+                .thenThrow(new DependencyUnavailableException("dynamodb", "markSubmitted", new IOException("timeout")));
+
+        FileRecord file = uploads.stream("a.png", "image/png", PNG.length, new ByteArrayInputStream(PNG), NO_KEY).file();
+
+        // the caller gets its id (202) rather than a 503 that makes it upload a second copy;
+        // S3's Object Created event marks the file SCANNING
+        assertThat(file.status()).isEqualTo(FileStatus.AWAITING_UPLOAD);
+        verify(storage).store(eq(file.id()), eq(FileType.PNG), eq((long) PNG.length), any());
     }
 
     @Test
@@ -160,11 +181,11 @@ class UploadServiceTests {
         }).when(storage).store(any(), any(), anyLong(), any());
         when(files.markSubmitted(any(), any())).thenReturn(Optional.empty());
 
-        Thread first = Thread.ofVirtual().start(() -> one.stream("a.png", "image/png", PNG.length, new ByteArrayInputStream(PNG)));
+        Thread first = Thread.ofVirtual().start(() -> one.stream("a.png", "image/png", PNG.length, new ByteArrayInputStream(PNG), NO_KEY));
         assertThat(storing.await(5, TimeUnit.SECONDS)).isTrue();
         assertThat(meters.get("file-upload-service.uploads.streaming").gauge().value()).isEqualTo(1);
 
-        assertThatThrownBy(() -> one.stream("b.png", "image/png", PNG.length, new ByteArrayInputStream(PNG)))
+        assertThatThrownBy(() -> one.stream("b.png", "image/png", PNG.length, new ByteArrayInputStream(PNG), NO_KEY))
                 .isInstanceOf(UploadCapacityExceededException.class);
 
         release.countDown();
@@ -176,7 +197,7 @@ class UploadServiceTests {
     void downloadsOnlyAvailableFiles() {
         String id = "0b8e2d4a-55a3-4d0e-9f53-3e1b5f0a7c11";
         when(files.find(id)).thenReturn(Optional.of(new FileRecord(id, "a.png", FileType.PNG, 1, UploadMethod.STREAM,
-                FileStatus.INFECTED, NOW, NOW, NOW, null, null, null)));
+                FileStatus.INFECTED, NOW, NOW, NOW, null, null, null, null)));
 
         assertThatThrownBy(() -> uploads.downloadUrl(id)).isInstanceOf(FileNotAvailableException.class);
         assertThatThrownBy(() -> uploads.downloadUrl("6a4b8c5e-0000-4000-8000-000000000000"))
