@@ -243,6 +243,10 @@ public record FileUploadServiceProperties(
      * @param consumers       threads receiving from the queue on each instance
      * @param overdueAfter    a scan with no result after this long is reported (2009)
      * @param monitorInterval how often the count of scans in progress is refreshed, and overdue scans looked for
+     * @param recoveryInterval how often files left in flight by a crash are looked for and finished
+     *                        ({@code InFlightRecovery}, README "Crash safety")
+     * @param resumePromotionAfter a file PROMOTING this long has lost the process promoting it: resume it.
+     *                        Longer than a promotion takes (well under a second), shorter than people wait
      * @param simulator       a stand-in for GuardDuty on a laptop; refused in production
      */
     public record Scan(
@@ -250,6 +254,8 @@ public record FileUploadServiceProperties(
             @DefaultValue("2") int consumers,
             @DefaultValue("5m") Duration overdueAfter,
             @DefaultValue("15s") Duration monitorInterval,
+            @DefaultValue("1m") Duration recoveryInterval,
+            @DefaultValue("2m") Duration resumePromotionAfter,
             @DefaultValue Simulator simulator) {
 
         public Scan {
@@ -262,6 +268,8 @@ public record FileUploadServiceProperties(
             }
             positive("scan.overdue-after", overdueAfter);
             positive("scan.monitor-interval", monitorInterval);
+            positive("scan.recovery-interval", recoveryInterval);
+            positive("scan.resume-promotion-after", resumePromotionAfter);
         }
 
         public boolean enabled() {

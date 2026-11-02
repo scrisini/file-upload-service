@@ -3,18 +3,18 @@
   "BillingMode": "PAY_PER_REQUEST",
   "AttributeDefinitions": [
     {"AttributeName": "id", "AttributeType": "S"},
-    {"AttributeName": "scanQueue", "AttributeType": "S"},
-    {"AttributeName": "submittedAt", "AttributeType": "N"}
+    {"AttributeName": "stage", "AttributeType": "S"},
+    {"AttributeName": "stageSince", "AttributeType": "N"}
   ],
   "KeySchema": [
     {"AttributeName": "id", "KeyType": "HASH"}
   ],
   "GlobalSecondaryIndexes": [
     {
-      "IndexName": "scanning",
+      "IndexName": "in-flight",
       "KeySchema": [
-        {"AttributeName": "scanQueue", "KeyType": "HASH"},
-        {"AttributeName": "submittedAt", "KeyType": "RANGE"}
+        {"AttributeName": "stage", "KeyType": "HASH"},
+        {"AttributeName": "stageSince", "KeyType": "RANGE"}
       ],
       "Projection": {"ProjectionType": "KEYS_ONLY"}
     }

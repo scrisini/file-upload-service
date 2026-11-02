@@ -15,7 +15,17 @@ promotes clean files. README "File lifecycle" has the states.
 - **Stateless, no filesystem** (a requirement): state only in DynamoDB, S3 and SQS; never write
   files, never parse multipart (it spools to disk), never buffer a whole upload in memory.
 - **GuardDuty has no scan-started event or in-progress count**: "picked up" is S3's Object Created
-  time, and the count comes from the sparse `scanning` index. Don't promise more than that.
+  time, and the count comes from the sparse `in-flight` index. Don't promise more than that.
+- **Crash safety is a requirement** (README "Crash safety"): a kill at any point must leave a state
+  another instance can finish. Keep every step an atomic conditional write or an idempotent S3 call,
+  keep in the record whatever finishing a step needs (like `scannedETag`), and never delete a record
+  while an event for it may still arrive. A new in-flight status joins the `in-flight` index and
+  `InFlightRecovery`, and gets a `kill -9` test against the local stack.
+- **Retries are idempotent** (`Idempotency-Key`, README "Idempotent retries"): the key decides the
+  file id, so creation is `createIfAbsent` and a write to quarantine that finds an object
+  (`If-None-Match`) is a replay, not an error. Keep both upload styles that way.
+- **`docs/test-scenarios.md` is the testers' catalogue.** A change in behaviour updates its rows
+  (and adds rows for new behaviour) in the same pull request.
 - **Every status change is a conditional write** that only moves forward; events are at-least-once
   and unordered. Keep new transitions idempotent and test redelivery.
 - **Only scanned bytes are promoted**: quarantine writes carry `If-None-Match: *`, promotion copies
@@ -40,6 +50,8 @@ promotes clean files. README "File lifecycle" has the states.
 scripts/dev.sh check           # verify local prerequisites
 scripts/dev.sh run [args...]   # start dependencies, then the app on :8080 (asks if taken); args go to Spring Boot
 scripts/dev.sh docker [args...] # the same with the app in Docker, built as production builds it
+scripts/try-upload.sh presigned|stream <file>   # upload and follow it (IDEMPOTENCY_KEY=… replays)
+scripts/send-scan-event.sh ...  # inject S3/GuardDuty events into the local queue (simulator off)
 scripts/dev.sh status          # dependency and app health
 scripts/dev.sh hooks           # install the git hooks: commit messages, plaintext secrets (once per clone)
 scripts/test-commit-msg.sh     # test the hook after changing it or .commitlintrc.json

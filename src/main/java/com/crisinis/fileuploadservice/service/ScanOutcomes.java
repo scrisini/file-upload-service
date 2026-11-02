@@ -1,6 +1,7 @@
 package com.crisinis.fileuploadservice.service;
 
 import java.time.Clock;
+import java.time.Instant;
 import java.util.EnumMap;
 import java.util.Locale;
 import java.util.Map;
@@ -39,6 +40,9 @@ public class ScanOutcomes {
         /** The object isn't one of this service's uploads, or its record no longer exists. */
         UNKNOWN_FILE
     }
+
+    /** The {@code reason} of a result read from the object's tag instead of GuardDuty's event. */
+    public static final String RECOVERED_FROM_TAG = "RECOVERED_FROM_OBJECT_TAG";
 
     private final FileRepository files;
     private final FileStorage storage;
@@ -92,19 +96,48 @@ public class ScanOutcomes {
 
     private Outcome scanned(ScanEvent.ScanCompleted event) {
         Optional<Update> update = storage.fileIdOf(event.bucket(), event.key())
-                .flatMap(id -> files.recordScan(id, event.result(), event.time(), event.reason()));
+                .flatMap(id -> files.recordScan(id, event.result(), event.time(), event.reason(), event.eTag()));
         if (update.isEmpty()) {
             return Outcome.UNKNOWN_FILE;
         }
-        FileRecord file = update.get().file();
-        if (update.get().changed()) {
-            report(file, event.result());
+        carryOn(update.get(), event.result());
+        return Outcome.HANDLED;
+    }
+
+    /**
+     * Finishes a promotion from the record alone, with the ETag it stored when the scan was
+     * recorded: for a file left PROMOTING when the process handling it died and its event can't be
+     * delivered again. Safe to repeat, and to run while the event is also being handled.
+     */
+    public void resumePromotion(FileRecord file) {
+        if (file.status() == FileStatus.PROMOTING) {
+            promote(file, file.scannedETag());
+        }
+    }
+
+    /**
+     * Applies a scan result read from the object's GuardDuty tag, for a file whose result event
+     * never reached the service. The ETag scanned isn't known, but quarantine objects can't be
+     * replaced ({@code If-None-Match: *}), so the object there is the one scanned.
+     *
+     * @return the file as it is now; empty if it has no record
+     */
+    public Optional<FileRecord> applyRecoveredResult(String id, ScanResult result, Instant at) {
+        Optional<Update> update = files.recordScan(id, result, at, RECOVERED_FROM_TAG, null);
+        update.ifPresent(u -> carryOn(u, result));
+        return update.map(Update::file);
+    }
+
+    /** After a result is recorded: report it if this call recorded it, and promote a clean file. */
+    private void carryOn(Update update, ScanResult result) {
+        FileRecord file = update.file();
+        if (update.changed()) {
+            report(file, result);
         }
         if (file.status() == FileStatus.PROMOTING) {
             // a redelivery after a failed promotion lands here too, and carries on
-            promote(file, event.eTag());
+            promote(file, file.scannedETag());
         }
-        return Outcome.HANDLED;
     }
 
     private void report(FileRecord file, ScanResult result) {

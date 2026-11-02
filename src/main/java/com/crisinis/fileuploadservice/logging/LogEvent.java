@@ -64,6 +64,14 @@ public enum LogEvent {
             "File scanned clean but refused: its content is not the declared type, or it changed after the scan"),
     SCAN_OVERDUE("FILE_UPLOAD_SERVICE-2009", Level.WARN,
             "No scan result for a file within the expected time; it stays SCANNING until one arrives"),
+    PROMOTION_RESUMED("FILE_UPLOAD_SERVICE-2010", Level.WARN,
+            "A promotion left unfinished by a crash or a lost event is being finished from the file's record"),
+    SCAN_RESULT_RECOVERED("FILE_UPLOAD_SERVICE-2011", Level.WARN,
+            "A scan result whose event never arrived was read from the object's GuardDuty tag and applied"),
+    UPLOAD_STORED_UNRECORDED("FILE_UPLOAD_SERVICE-2012", Level.WARN,
+            "A streamed file was stored but its status couldn't be updated; S3's event updates it, the caller got 202"),
+    UPLOAD_REPLAYED("FILE_UPLOAD_SERVICE-2013", Level.INFO,
+            "A retried upload with the same Idempotency-Key was answered with the file its first attempt created"),
 
     DEPENDENCY_UNAVAILABLE("FILE_UPLOAD_SERVICE-3001", Level.WARN,
             "An AWS call failed; the caller got HTTP 503 and may retry"),
@@ -77,6 +85,8 @@ public enum LogEvent {
             "Receiving from the scan queue failed; retrying with backoff, results wait in the queue"),
     SCAN_MONITOR_FAILED("FILE_UPLOAD_SERVICE-3006", Level.WARN,
             "Counting scans in progress failed; the gauge keeps its last value and the next run retries"),
+    RECOVERY_FAILED("FILE_UPLOAD_SERVICE-3007", Level.WARN,
+            "Finishing a file left in flight failed; the next recovery run tries again"),
 
     UNEXPECTED_ERROR("FILE_UPLOAD_SERVICE-9001", Level.ERROR,
             "Unexpected failure while handling a request; the caller got HTTP 500");

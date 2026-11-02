@@ -171,7 +171,7 @@ it to see one file's whole history. `GET /api/v1/files/<id>` shows its status an
 - **Means:** a caller asked to upload a `file-upload-service.file_type` of `file-upload-service.size` bytes and got a URL that works
   until `file-upload-service.expires_at`. The file is `AWAITING_UPLOAD` until the bytes land
   ([2004](#file_upload_service-2004)). A URL never used leaves no object; DynamoDB's TTL removes the record
-  an hour after the URL expires.
+  15 days after the URL expires (longer than any event can wait in SQS).
 - **Check:** a caller reporting a 403 from S3 on the PUT sent different headers from those returned
   (each is signed), or the URL expired. A 412 means it PUT twice: the first upload counts.
 
@@ -252,9 +252,57 @@ it to see one file's whole history. `GET /api/v1/files/<id>` shows its status an
 - **Level:** WARN. Reported once per file, by one instance.
 - **Means:** the file landed more than `file-upload-service.overdue_after` ago and GuardDuty hasn't reported.
   It stays `SCANNING`; a late result is still applied.
-- **Check:** many at once: GuardDuty's protection plan status for the bucket (console, or the
-  "GuardDuty Malware Protection Resource Status" events), the EventBridge rule for scan results, and
-  the scan queue's dead-letter queue. One alone: GuardDuty may still be scanning a large file.
+- **Check:** if GuardDuty has tagged the object, the recovery job applies the result within a
+  minute ([2011](#file_upload_service-2011)), so a file that stays overdue has no result yet. Many at once: GuardDuty's
+  protection plan status for the bucket (console, or the "GuardDuty Malware Protection Resource
+  Status" events), that **tagging is on** in the plan, the EventBridge rule for scan results, and the
+  scan queue's dead-letter queue. One alone: GuardDuty may still be scanning a large file.
+
+<a id="file_upload_service-2010"></a>
+### FILE_UPLOAD_SERVICE-2010: A promotion left unfinished is being finished
+
+- **Level:** WARN. Recovers by itself.
+- **Means:** the file `file-upload-service.file_id` was scanned clean at `file-upload-service.scanned_at` and has been
+  `PROMOTING` longer than `scan.resume-promotion-after` (2 minutes): the instance promoting it
+  stopped (killed, crashed, out of memory) and its event hasn't been delivered again, or went to the
+  dead-letter queue. The recovery job finishes it from the record, which holds the version scanned;
+  look for [2005](#file_upload_service-2005) or [2008](#file_upload_service-2008) for the same file next.
+- **Check:** one now and then after a deploy or a crash is expected. Many: instances are dying
+  mid-work (restarts, `OOMKilled`), or S3 is failing ([3007](#file_upload_service-3007) follows).
+
+<a id="file_upload_service-2011"></a>
+### FILE_UPLOAD_SERVICE-2011: A scan result was recovered from the object's tag
+
+- **Level:** WARN. Recovers by itself.
+- **Means:** the file `file-upload-service.file_id` was `SCANNING` past `scan.overdue-after`, but GuardDuty had
+  tagged the object `GuardDutyMalwareScanStatus=file-upload-service.scan_result`: the result event never reached the
+  service (dead-lettered after repeated crashes, or lost on the way). The result is applied from the
+  tag, and the file carries on as if the event had arrived (`reason` `RECOVERED_FROM_OBJECT_TAG`; for
+  `THREATS_FOUND` the threat's name isn't known).
+- **Check:** many at once point at the event path: the EventBridge rule for scan results, the
+  queue policy, the dead-letter queue ([3002](#file_upload_service-3002)). Messages for these files left in the
+  dead-letter queue are now harmless to redrive.
+
+<a id="file_upload_service-2012"></a>
+### FILE_UPLOAD_SERVICE-2012: A streamed file was stored but its status wasn't updated
+
+- **Level:** WARN. Recovers by itself.
+- **Means:** the file `file-upload-service.file_id` is in quarantine, but DynamoDB failed when the service marked
+  it `SCANNING` (`error.*`). The caller got 202 and its id anyway; S3's "Object Created" event marks
+  the file within seconds, and GuardDuty is scanning it regardless.
+- **Check:** if the file stays `AWAITING_UPLOAD` for minutes, follow [3001](#file_upload_service-3001) for DynamoDB and
+  [3005](#file_upload_service-3005) for the queue.
+
+<a id="file_upload_service-2013"></a>
+### FILE_UPLOAD_SERVICE-2013: A retried upload was answered with its first file
+
+- **Level:** INFO. Normal: clients retry after timeouts and dropped connections.
+- **Means:** a caller sent an `Idempotency-Key` it had used before, for the same file, and got the
+  file `file-upload-service.file_id` that its first attempt created (now `file-upload-service.status`), with
+  `Idempotent-Replayed: true`. Nothing was stored twice. A presigned retry gets a fresh URL while the
+  bytes haven't landed.
+- **Check:** nothing, unless one key repeats many times a minute: a client stuck retrying a request
+  that keeps failing for it (look for its 4xx, [2003](#file_upload_service-2003)).
 
 ## Dependencies (3xxx)
 
@@ -275,9 +323,11 @@ it to see one file's whole history. `GET /api/v1/files/<id>` shows its status an
 - **Means:** a dependency failed while acting on `file-upload-service.event`. The message stays on the queue and
   SQS delivers it again after the visibility timeout; `file-upload-service.receive_count` counts attempts.
   After the queue's `maxReceiveCount` it moves to the dead-letter queue.
-- **Check:** if it repeats, follow [3001](#file_upload_service-3001). Messages in the dead-letter queue are files
-  stuck `SCANNING` or `PROMOTING`: once the cause is fixed, redrive them to the queue (SQS console,
-  "Start DLQ redrive"); handling them again is safe.
+- **Check:** if it repeats, follow [3001](#file_upload_service-3001). A message that reaches the dead-letter queue
+  doesn't strand its file: the recovery job finishes promotions ([2010](#file_upload_service-2010)) and applies
+  results GuardDuty tagged on the object ([2011](#file_upload_service-2011)). Redriving the dead-letter queue (SQS
+  console, "Start DLQ redrive") is still safe, and needed for "Object Created" events of files left
+  `AWAITING_UPLOAD`.
 
 <a id="file_upload_service-3003"></a>
 ### FILE_UPLOAD_SERVICE-3003: Unrecognised message on the scan queue
@@ -314,6 +364,15 @@ it to see one file's whole history. `GET /api/v1/files/<id>` shows its status an
 - **Means:** DynamoDB failed `file-upload-service.operation` in the scan monitor. `file-upload-service.scan.in-progress` keeps
   its last value, and overdue scans wait for the next run.
 - **Check:** as [3001](#file_upload_service-3001), for DynamoDB.
+
+<a id="file_upload_service-3007"></a>
+### FILE_UPLOAD_SERVICE-3007: Finishing a file left in flight failed
+
+- **Level:** WARN. Recovers by itself.
+- **Means:** the recovery job ([2010](#file_upload_service-2010), [2011](#file_upload_service-2011)) couldn't finish the file
+  `file-upload-service.file_id` in `file-upload-service.stage` (no file id: it couldn't read the in-flight index). `error.*` says
+  which dependency failed. The next run, a minute later, tries again.
+- **Check:** as [3001](#file_upload_service-3001). Repeating for one file only: escalate with its id.
 
 ## Unexpected failures (9xxx)
 
