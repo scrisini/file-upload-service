@@ -4,7 +4,8 @@ import org.springframework.http.HttpStatus;
 
 /**
  * An upload refused before anything was stored, with the HTTP status that says why: 400 invalid,
- * 411 no length, 413 too large, 415 type not accepted or content not of the declared type.
+ * 411 no length, 413 too large, 415 type not accepted or content not of the declared type, 422 an
+ * idempotency key already used for another file.
  */
 public class UploadRejectedException extends RuntimeException {
 
@@ -15,7 +16,8 @@ public class UploadRejectedException extends RuntimeException {
         LENGTH_REQUIRED(HttpStatus.LENGTH_REQUIRED),
         TOO_LARGE(HttpStatus.CONTENT_TOO_LARGE),
         UNSUPPORTED_TYPE(HttpStatus.UNSUPPORTED_MEDIA_TYPE),
-        CONTENT_MISMATCH(HttpStatus.UNSUPPORTED_MEDIA_TYPE);
+        CONTENT_MISMATCH(HttpStatus.UNSUPPORTED_MEDIA_TYPE),
+        IDEMPOTENCY_KEY_REUSED(HttpStatus.UNPROCESSABLE_CONTENT);
 
         private final HttpStatus status;
 

@@ -28,6 +28,7 @@ import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.S3Object;
+import software.amazon.awssdk.services.s3.model.Tag;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 import software.amazon.awssdk.services.s3.presigner.model.PresignedPutObjectRequest;
 
@@ -51,6 +52,9 @@ public class FileStorage {
         /** No object in quarantine: promoted earlier, or removed. */
         SOURCE_MISSING
     }
+
+    /** The tag GuardDuty Malware Protection for S3 puts its result in. */
+    public static final String SCAN_STATUS_TAG = "GuardDutyMalwareScanStatus";
 
     private final S3Client s3;
     private final S3Presigner presigner;
@@ -153,6 +157,35 @@ public class FileStorage {
         }
         call("DeleteObject", () -> s3.deleteObject(d -> d.bucket(storage.quarantineBucket()).key(quarantineKey(id))));
         return Promotion.COPIED;
+    }
+
+    /**
+     * GuardDuty's result from the object's {@value #SCAN_STATUS_TAG} tag, which it adds after each
+     * scan when the protection plan has tagging on: a record of the result that doesn't depend on
+     * the event reaching the service. Empty while unscanned, or if the object isn't there.
+     */
+    public Optional<String> scanStatusTag(String id) {
+        try {
+            return s3.getObjectTagging(t -> t.bucket(storage.quarantineBucket()).key(quarantineKey(id))).tagSet().stream()
+                    .filter(tag -> SCAN_STATUS_TAG.equals(tag.key()))
+                    .map(Tag::value)
+                    .findFirst();
+        } catch (NoSuchKeyException e) {
+            return Optional.empty();
+        } catch (S3Exception e) {
+            if (e.statusCode() == 404) {
+                return Optional.empty();
+            }
+            throw new DependencyUnavailableException("s3", "GetObjectTagging", e);
+        } catch (SdkException e) {
+            throw new DependencyUnavailableException("s3", "GetObjectTagging", e);
+        }
+    }
+
+    /** Tags an object in quarantine as GuardDuty does (the local GuardDuty simulator). */
+    public void tagScanStatus(String id, String scanResultStatus) {
+        call("PutObjectTagging", () -> s3.putObjectTagging(t -> t.bucket(storage.quarantineBucket())
+                .key(quarantineKey(id)).tagging(g -> g.tagSet(Tag.builder().key(SCAN_STATUS_TAG).value(scanResultStatus).build()))));
     }
 
     /** Whether the file is in the clean bucket. */

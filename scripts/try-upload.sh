@@ -9,6 +9,10 @@
 # The content type defaults to what `file --mime-type` says. FILE_UPLOAD_SERVICE_URL picks the
 # instance; by default it's the port `scripts/dev.sh run` or `docker` last chose, else 8080. Needs
 # curl; jq makes the output easier to read.
+#
+# Each upload carries an Idempotency-Key, printed so it can be replayed: run again with
+# IDEMPOTENCY_KEY=<key> to retry the same upload (the answer says Idempotent-Replayed: true), or
+# IDEMPOTENCY_KEY= (empty) to send none.
 
 set -euo pipefail
 
@@ -24,30 +28,52 @@ field() {
 }
 
 [ "$#" -ge 2 ] || die "usage: $0 presigned|stream <file> [content-type]"
+headers="$(mktemp)"
+trap 'rm -f "$headers"' EXIT
+replayed() {
+    if grep -qi '^Idempotent-Replayed: true' "$headers"; then
+        printf '==> Idempotent-Replayed: true (the file an earlier attempt with this key created)\n'
+    fi
+}
 style="$1" file="$2"
 [ -f "$file" ] || die "no such file: $file"
 type="${3:-$(file --brief --mime-type "$file")}"
 size="$(wc -c < "$file" | tr -d ' ')"
 name="$(basename "$file")"
+if [ -z "${IDEMPOTENCY_KEY+set}" ]; then
+    IDEMPOTENCY_KEY="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+fi
+# never empty, so it expands safely under `set -u` in bash 3.2
+key_header=(-H "Accept: application/json, application/problem+json")
+if [ -n "$IDEMPOTENCY_KEY" ]; then
+    key_header=(-H "Idempotency-Key: $IDEMPOTENCY_KEY")
+    printf '==> Idempotency-Key: %s (IDEMPOTENCY_KEY=%s replays this upload)\n' "$IDEMPOTENCY_KEY" "$IDEMPOTENCY_KEY"
+fi
 
 case "$style" in
     presigned)
         printf '==> POST /api/v1/uploads (%s, %s bytes)\n' "$type" "$size"
-        response="$(curl -sS -X POST "$BASE/api/v1/uploads" -H 'Content-Type: application/json' \
+        response="$(curl -sS -D "$headers" -X POST "$BASE/api/v1/uploads" -H 'Content-Type: application/json' \
+            "${key_header[@]}" \
             -d "{\"fileName\":\"$name\",\"contentType\":\"$type\",\"size\":$size}")"
         printf '%s' "$response" | show
-        url="$(field "$response" url)"
-        [ -n "$url" ] || die "no upload URL in the response"
+        replayed
         id="$(field "$response" id)"
-        printf '==> PUT the bytes straight to S3 (the service never sees them)\n'
-        curl -sS -o /dev/null -w '    S3 answered HTTP %{http_code}\n' -X PUT --upload-file "$file" \
-            -H "Content-Type: $type" -H 'If-None-Match: *' "$url"
+        url="$(field "$response" url)"
+        if [ -n "$url" ]; then
+            printf '==> PUT the bytes straight to S3 (the service never sees them)\n'
+            curl -sS -o /dev/null -w '    S3 answered HTTP %{http_code}\n' -X PUT --upload-file "$file" \
+                -H "Content-Type: $type" -H 'If-None-Match: *' "$url"
+        else
+            printf '==> no upload URL: the bytes already landed with an earlier attempt\n'
+        fi
         ;;
     stream)
         printf '==> POST /api/v1/files (%s, %s bytes, through the service)\n' "$type" "$size"
-        response="$(curl -sS -X POST "$BASE/api/v1/files?fileName=$name" -H "Content-Type: $type" \
-            --data-binary "@$file")"
+        response="$(curl -sS -D "$headers" -X POST "$BASE/api/v1/files?fileName=$name" -H "Content-Type: $type" \
+            "${key_header[@]}" --data-binary "@$file")"
         printf '%s' "$response" | show
+        replayed
         id="$(field "$response" id)"
         ;;
     *) die "style must be presigned or stream, not $style" ;;

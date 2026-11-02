@@ -9,6 +9,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.EnumMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.Semaphore;
 
@@ -17,11 +18,13 @@ import com.crisinis.fileuploadservice.logging.LogEvent;
 import com.crisinis.fileuploadservice.model.FileRecord;
 import com.crisinis.fileuploadservice.model.FileStatus;
 import com.crisinis.fileuploadservice.model.FileType;
+import com.crisinis.fileuploadservice.model.IdempotencyKey;
 import com.crisinis.fileuploadservice.model.UploadMethod;
 import com.crisinis.fileuploadservice.persistence.FileRepository;
 import com.crisinis.fileuploadservice.service.UploadRejectedException.Reason;
 import com.crisinis.fileuploadservice.storage.FileStorage;
 import com.crisinis.fileuploadservice.storage.ObjectExistsException;
+import com.crisinis.fileuploadservice.storage.PresignedUpload;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -74,35 +77,55 @@ public class UploadService {
                 .description("Streamed uploads in progress on this instance").register(registry);
     }
 
-    /** Presigned style: records the file and returns a URL that accepts exactly this file. */
-    public UploadTicket requestUpload(String fileName, String mediaType, long size) {
+    /**
+     * Presigned style: records the file and returns a URL that accepts exactly this file. With an
+     * idempotency key a retry gets the same file: a fresh URL while its bytes haven't landed, and
+     * no URL once they have.
+     */
+    public UploadResult requestUpload(String fileName, String mediaType, long size, Optional<IdempotencyKey> key) {
         FileType type = accept(UploadMethod.PRESIGNED_URL, mediaType, size);
-        FileRecord file = FileRecord.awaitingUpload(UUID.randomUUID().toString(), cleanName(fileName), type, size,
+        FileRecord requested = FileRecord.awaitingUpload(idFor(key), cleanName(fileName), type, size,
                 UploadMethod.PRESIGNED_URL, clock.instant());
-        files.create(file);
+        FileRepository.Update created = files.createIfAbsent(requested);
+        FileRecord file = sameRequest(created, requested);
+        if (file.status() != FileStatus.AWAITING_UPLOAD) {
+            return replayed(file, null);
+        }
         var upload = storage.presignUpload(file.id(), type, size, uploads.urlTtl());
+        if (!created.changed()) {
+            return replayed(file, upload);
+        }
         accepted.get(UploadMethod.PRESIGNED_URL).increment();
         LogEvent.UPLOAD_URL_ISSUED.at(log).with("file_id", file.id()).with("file_type", type)
                 .with("size", size).with("expires_at", upload.expiresAt()).log();
-        return new UploadTicket(file, upload);
+        return new UploadResult(file, upload, false);
     }
 
     /**
      * Stream style: checks the declared type, the length and the content's signature, then streams
-     * the body to quarantine. Nothing is stored if a check fails.
+     * the body to quarantine. Nothing is stored if a check fails. With an idempotency key a retry of
+     * a file that already landed is answered with that file, without reading the body again.
      *
      * @param contentLength the request's Content-Length; -1 when it has none (chunked)
      */
-    public FileRecord stream(String fileName, String mediaType, long contentLength, InputStream body) {
+    public UploadResult stream(String fileName, String mediaType, long contentLength, InputStream body,
+                               Optional<IdempotencyKey> key) {
         if (contentLength < 0) {
             throw reject(UploadMethod.STREAM, Reason.LENGTH_REQUIRED, "send the file with a Content-Length header");
         }
         FileType type = accept(UploadMethod.STREAM, mediaType, contentLength);
+        FileRecord requested = FileRecord.awaitingUpload(idFor(key), cleanName(fileName), type, contentLength,
+                UploadMethod.STREAM, clock.instant());
+        Optional<FileRecord> landed = key.flatMap(k -> files.find(requested.id()))
+                .filter(existing -> existing.status() != FileStatus.AWAITING_UPLOAD);
+        if (landed.isPresent()) {
+            return replayed(sameRequest(new FileRepository.Update(false, landed.get()), requested), null);
+        }
         if (!streams.tryAcquire()) {
             throw new UploadCapacityExceededException(uploads.maxConcurrentStreams());
         }
         try {
-            return streamAccepted(cleanName(fileName), type, contentLength, body);
+            return streamAccepted(requested, body, key.isPresent());
         } finally {
             streams.release();
         }
@@ -122,36 +145,88 @@ public class UploadService {
         return storage.presignDownload(id, file.fileName(), DOWNLOAD_TTL);
     }
 
-    private FileRecord streamAccepted(String fileName, FileType type, long size, InputStream body) {
+    private UploadResult streamAccepted(FileRecord requested, InputStream body, boolean keyed) {
+        FileType type = requested.type();
+        long size = requested.size();
         byte[] signature = readSignature(body, size);
         if (!type.matches(signature)) {
             throw reject(UploadMethod.STREAM, Reason.CONTENT_MISMATCH,
                     "the content is not " + type.mediaType() + FileType.detect(signature)
                             .map(actual -> " (it looks like " + actual.mediaType() + ")").orElse(""));
         }
-        FileRecord file = FileRecord.awaitingUpload(UUID.randomUUID().toString(), fileName, type, size,
-                UploadMethod.STREAM, clock.instant());
-        files.create(file);
+        FileRecord file = sameRequest(files.createIfAbsent(requested), requested);
+        if (file.status() != FileStatus.AWAITING_UPLOAD) {
+            // a concurrent attempt with the same key landed it meanwhile
+            return replayed(file, null);
+        }
         ExactLengthInputStream rest = new ExactLengthInputStream(
                 new SequenceInputStream(new ByteArrayInputStream(signature), body), size);
         try {
             storage.store(file.id(), type, size, rest);
-        } catch (DependencyUnavailableException | ObjectExistsException e) {
-            files.delete(file.id());
+        } catch (ObjectExistsException e) {
+            if (!keyed) {
+                throw e;
+            }
+            // an earlier attempt with this key stored it, and died or lost its answer before saying so
+            return replayed(submitted(file), null);
+        } catch (DependencyUnavailableException e) {
+            // The record is kept either way, never deleted: S3 may have stored the file and only the
+            // answer been lost (its event will find the record), and a retry with the same key may be
+            // using it. If nothing landed, DynamoDB's TTL removes it.
             if (rest.endedEarly()) {
                 throw reject(UploadMethod.STREAM, Reason.INCOMPLETE,
                         "the body ended before the " + size + " bytes in Content-Length");
             }
             throw e;
         }
-        var update = files.markSubmitted(file.id(), clock.instant());
-        if (update.map(FileRepository.Update::changed).orElse(false)) {
-            streamedBytes.increment(size);
-        }
-        FileRecord submitted = update.map(FileRepository.Update::file).orElse(file);
         accepted.get(UploadMethod.STREAM).increment();
         LogEvent.UPLOAD_STREAMED.at(log).with("file_id", file.id()).with("file_type", type).with("size", size).log();
-        return submitted;
+        return new UploadResult(submitted(file), null, false);
+    }
+
+    /**
+     * Marks a stored file SCANNING. The file is safe in quarantine whatever happens here: if
+     * DynamoDB fails, S3's "Object Created" event marks it instead, so the caller still gets 202
+     * and its id rather than a 503 that would make it upload a second copy.
+     */
+    private FileRecord submitted(FileRecord file) {
+        try {
+            var update = files.markSubmitted(file.id(), clock.instant());
+            if (update.map(FileRepository.Update::changed).orElse(false)) {
+                streamedBytes.increment(file.size());
+            }
+            return update.map(FileRepository.Update::file).orElse(file);
+        } catch (DependencyUnavailableException e) {
+            LogEvent.UPLOAD_STORED_UNRECORDED.at(log).with("file_id", file.id()).cause(e).log();
+            return file;
+        }
+    }
+
+    /** A new random id, or the id an idempotency key stands for. */
+    private static String idFor(Optional<IdempotencyKey> key) {
+        return key.map(IdempotencyKey::fileId).orElseGet(() -> UUID.randomUUID().toString());
+    }
+
+    /**
+     * The file a key already stands for must be the file now described: a key reused for another
+     * file is refused (422) rather than answered with the wrong one.
+     */
+    private FileRecord sameRequest(FileRepository.Update created, FileRecord requested) {
+        FileRecord file = created.file();
+        if (!created.changed() && !(file.fileName().equals(requested.fileName()) && file.type() == requested.type()
+                && file.size() == requested.size() && file.method() == requested.method())) {
+            throw reject(requested.method(), Reason.IDEMPOTENCY_KEY_REUSED,
+                    "this Idempotency-Key was used for another file (" + file.fileName() + ", " + file.type().mediaType()
+                            + ", " + file.size() + " bytes, " + file.method() + "); use a new key for a new file");
+        }
+        return file;
+    }
+
+    /** The answer to a retry: the file the key already stands for. */
+    private UploadResult replayed(FileRecord file, PresignedUpload upload) {
+        LogEvent.UPLOAD_REPLAYED.at(log).with("file_id", file.id()).with("method", file.method())
+                .with("status", file.status()).log();
+        return new UploadResult(file, upload, true);
     }
 
     /** The first bytes of the body, to check its type before anything is stored. */

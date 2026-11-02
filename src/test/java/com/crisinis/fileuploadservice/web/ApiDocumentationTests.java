@@ -43,7 +43,7 @@ class ApiDocumentationTests {
                 .andExpect(jsonPath(STREAM_BODY + "['application/pdf'].schema.format").value("binary"))
                 .andExpect(jsonPath(STREAM_BODY, not(hasKey("multipart/form-data"))))
                 .andExpect(jsonPath("$.paths['/api/v1/files'].post.parameters[*].name").value(
-                        org.hamcrest.Matchers.contains("fileName")))
+                        org.hamcrest.Matchers.containsInAnyOrder("fileName", "Idempotency-Key")))
                 .andExpect(jsonPath("$.paths['/api/v1/files'].post.responses", hasKey("415")));
     }
 

@@ -32,17 +32,26 @@ import software.amazon.awssdk.services.dynamodb.model.UpdateItemRequest;
  * file. Every status change is a conditional write, so events delivered twice, out of order or to
  * two instances at once can't move a file backwards.
  *
- * <p>Files being scanned also carry {@code scanQueue = "SCANNING"}, which puts them in the sparse
- * {@code scanning} index (sort key {@code submittedAt}). Counting scans in progress and finding
- * overdue ones read only that index, never the table. Schema: README "Data".
+ * <p>A file in flight (SCANNING or PROMOTING) also carries {@code stage} (its status) and
+ * {@code stageSince} (when it entered it), which put it in the sparse {@code in-flight} index.
+ * Counting scans in progress, finding overdue scans and finding promotions a crash interrupted read
+ * only that index, never the table. Schema: README "Data".
+ *
+ * <p>Crash safety (README "Crash safety"): every write here is one atomic, conditional item update,
+ * and the record holds everything needed to carry on from it, so a process that dies between any
+ * two steps leaves a state another instance can finish.
  */
 @Repository
 public class FileRepository {
 
-    public static final String SCANNING_INDEX = "scanning";
-    private static final String SCANNING = "SCANNING";
-    /** A record whose upload never arrives is deleted by DynamoDB's TTL this long after its URL expires. */
-    private static final Duration ABANDONED_AFTER = Duration.ofHours(1);
+    public static final String IN_FLIGHT_INDEX = "in-flight";
+    /**
+     * A record whose upload never lands is deleted by DynamoDB's TTL this long after its URL expires.
+     * It must outlast every event still on its way: SQS keeps events 4 days and the dead-letter queue
+     * up to 14, and an upload's "Object Created" may wait there while the service is down. A record
+     * deleted before its event is handled would strand a scanned file in quarantine.
+     */
+    static final Duration ABANDONED_AFTER = Duration.ofDays(15);
 
     /**
      * A conditional update's outcome.
@@ -63,8 +72,17 @@ public class FileRepository {
         this.urlTtl = properties.uploads().urlTtl();
     }
 
-    /** Stores a new record; it expires unless its upload arrives ({@code expiresAt}, DynamoDB TTL). */
-    public void create(FileRecord file) {
+    /**
+     * Stores a new record, unless one with its id exists: then that one is returned, unchanged. Two
+     * attempts with the same idempotency key race here, and exactly one creates the record. A new
+     * record expires unless its upload lands ({@code expiresAt}, DynamoDB TTL).
+     *
+     * <p>Records are never deleted by the service, even when an upload fails: a retry or an event
+     * for the same id may still be on its way. Only the TTL removes them.
+     *
+     * @return changed when this call created the record
+     */
+    public Update createIfAbsent(FileRecord file) {
         Map<String, AttributeValue> item = new HashMap<>();
         item.put("id", s(file.id()));
         item.put("fileName", s(file.fileName()));
@@ -74,8 +92,14 @@ public class FileRepository {
         item.put("status", s(file.status().name()));
         item.put("createdAt", n(file.createdAt().toEpochMilli()));
         item.put("expiresAt", n(file.createdAt().plus(urlTtl).plus(ABANDONED_AFTER).getEpochSecond()));
-        call("PutItem", () -> dynamo.putItem(r -> r.tableName(table).item(item)
-                .conditionExpression("attribute_not_exists(id)")));
+        try {
+            call("PutItem", () -> dynamo.putItem(r -> r.tableName(table).item(item)
+                    .conditionExpression("attribute_not_exists(id)")));
+            return new Update(true, file);
+        } catch (ConditionalCheckFailedException exists) {
+            // another attempt created it first; if TTL removed it in between, this one creates it again
+            return find(file.id()).map(existing -> new Update(false, existing)).orElseGet(() -> createIfAbsent(file));
+        }
     }
 
     /** The record with this id; empty if there's none (never created, or expired unused). */
@@ -85,11 +109,6 @@ public class FileRepository {
         return item == null || item.isEmpty() ? Optional.empty() : Optional.of(toRecord(item));
     }
 
-    /** Deletes a record whose upload failed before anything was stored. */
-    public void delete(String id) {
-        call("DeleteItem", () -> dynamo.deleteItem(r -> r.tableName(table).key(key(id))));
-    }
-
     /**
      * The object landed in quarantine at {@code at}: AWAITING_UPLOAD becomes SCANNING. If the file
      * is already past that (its scan result came first), only the time is filled in.
@@ -97,28 +116,45 @@ public class FileRepository {
     public Optional<Update> markSubmitted(String id, Instant at) {
         try {
             return Optional.of(new Update(true, update("markSubmitted", UpdateItemRequest.builder().key(key(id))
-                    .updateExpression("SET #status = :scanning, submittedAt = :at, scanQueue = :scanning REMOVE expiresAt")
+                    .updateExpression("SET #status = :scanning, submittedAt = :at, stage = :scanning, stageSince = :at "
+                            + "REMOVE expiresAt")
                     .conditionExpression("#status = :awaiting")
-                    .expressionAttributeValues(Map.of(":scanning", s(SCANNING), ":at", n(at.toEpochMilli()),
+                    .expressionAttributeValues(Map.of(":scanning", s(FileStatus.SCANNING.name()), ":at", n(at.toEpochMilli()),
                             ":awaiting", s(FileStatus.AWAITING_UPLOAD.name()))))));
         } catch (ConditionalCheckFailedException alreadyPast) {
             return fillIn(id, "submittedAt", at);
         }
     }
 
-    /** Records GuardDuty's result: SCANNING (or AWAITING_UPLOAD) moves to the result's status. */
-    public Optional<Update> recordScan(String id, ScanResult result, Instant at, String reason) {
+    /**
+     * Records GuardDuty's result: SCANNING (or AWAITING_UPLOAD) moves to the result's status. A clean
+     * file enters PROMOTING with the ETag GuardDuty scanned, so the promotion can be finished from
+     * the record if the process handling it dies.
+     *
+     * @param scannedETag the version scanned; null when unknown (a result recovered from the object's tag)
+     */
+    public Optional<Update> recordScan(String id, ScanResult result, Instant at, String reason, String scannedETag) {
         Map<String, AttributeValue> values = new HashMap<>(Map.of(
                 ":next", s(result.next().name()), ":result", s(result.name()), ":at", n(at.toEpochMilli()),
                 ":awaiting", s(FileStatus.AWAITING_UPLOAD.name()), ":scanning", s(FileStatus.SCANNING.name())));
         String set = "SET #status = :next, scanResult = :result, scannedAt = :at";
+        String remove = " REMOVE expiresAt";
+        if (result.next() == FileStatus.PROMOTING) {
+            set += ", stage = :next, stageSince = :at";
+        } else {
+            remove += ", stage, stageSince";
+        }
         if (reason != null) {
             set += ", reason = :reason";
             values.put(":reason", s(reason));
         }
+        if (scannedETag != null) {
+            set += ", scannedETag = :etag";
+            values.put(":etag", s(scannedETag));
+        }
         try {
             return Optional.of(new Update(true, update("recordScan", UpdateItemRequest.builder().key(key(id))
-                    .updateExpression(set + " REMOVE scanQueue, expiresAt")
+                    .updateExpression(set + remove)
                     .conditionExpression("#status IN (:awaiting, :scanning)")
                     .expressionAttributeValues(values))));
         } catch (ConditionalCheckFailedException alreadyRecorded) {
@@ -136,7 +172,7 @@ public class FileRepository {
         AttributeValue value = outcome == FileStatus.AVAILABLE ? n(at.toEpochMilli()) : s(reason);
         try {
             return Optional.of(new Update(true, update("finishPromotion", UpdateItemRequest.builder().key(key(id))
-                    .updateExpression(set)
+                    .updateExpression(set + " REMOVE stage, stageSince")
                     .conditionExpression("#status = :promoting")
                     .expressionAttributeValues(Map.of(":outcome", s(outcome.name()), ":value", value,
                             ":promoting", s(FileStatus.PROMOTING.name()))))));
@@ -150,7 +186,8 @@ public class FileRepository {
         long count = 0;
         Map<String, AttributeValue> start = null;
         do {
-            QueryResponse page = query("countScanning", scanningQuery().select(Select.COUNT).exclusiveStartKey(start));
+            QueryResponse page = query("countScanning",
+                    stageQuery(FileStatus.SCANNING).select(Select.COUNT).exclusiveStartKey(start));
             count += page.count();
             start = page.hasLastEvaluatedKey() && !page.lastEvaluatedKey().isEmpty() ? page.lastEvaluatedKey() : null;
         } while (start != null);
@@ -159,15 +196,18 @@ public class FileRepository {
 
     /** When the longest-waiting scan started; empty when none is in progress. */
     public Optional<Instant> oldestScanning() {
-        QueryResponse page = query("oldestScanning", scanningQuery().limit(1));
-        return page.items().stream().findFirst().map(item -> instant(item, "submittedAt"));
+        QueryResponse page = query("oldestScanning", stageQuery(FileStatus.SCANNING).limit(1));
+        return page.items().stream().findFirst().map(item -> instant(item, "stageSince"));
     }
 
-    /** Up to {@code limit} files submitted before {@code cutoff} and still scanning, oldest first. */
-    public List<String> scanningSince(Instant cutoff, int limit) {
-        QueryResponse page = query("scanningSince", QueryRequest.builder().tableName(table).indexName(SCANNING_INDEX)
-                .keyConditionExpression("scanQueue = :scanning AND submittedAt < :cutoff")
-                .expressionAttributeValues(Map.of(":scanning", s(SCANNING), ":cutoff", n(cutoff.toEpochMilli())))
+    /**
+     * Up to {@code limit} files that entered {@code stage} (SCANNING or PROMOTING) before {@code cutoff}
+     * and are still in it, oldest first: overdue scans, and promotions a crash interrupted.
+     */
+    public List<String> inStageSince(FileStatus stage, Instant cutoff, int limit) {
+        QueryResponse page = query("inStageSince", QueryRequest.builder().tableName(table).indexName(IN_FLIGHT_INDEX)
+                .keyConditionExpression("stage = :stage AND stageSince < :cutoff")
+                .expressionAttributeValues(Map.of(":stage", s(inFlight(stage).name()), ":cutoff", n(cutoff.toEpochMilli())))
                 .limit(limit));
         List<String> ids = new ArrayList<>(page.items().size());
         for (Map<String, AttributeValue> item : page.items()) {
@@ -190,11 +230,18 @@ public class FileRepository {
         }
     }
 
-    private QueryRequest.Builder scanningQuery() {
-        return QueryRequest.builder().tableName(table).indexName(SCANNING_INDEX)
-                .keyConditionExpression("scanQueue = :scanning")
-                .expressionAttributeValues(Map.of(":scanning", s(SCANNING)))
+    private QueryRequest.Builder stageQuery(FileStatus stage) {
+        return QueryRequest.builder().tableName(table).indexName(IN_FLIGHT_INDEX)
+                .keyConditionExpression("stage = :stage")
+                .expressionAttributeValues(Map.of(":stage", s(inFlight(stage).name())))
                 .scanIndexForward(true);
+    }
+
+    private static FileStatus inFlight(FileStatus stage) {
+        if (stage != FileStatus.SCANNING && stage != FileStatus.PROMOTING) {
+            throw new IllegalArgumentException("only SCANNING and PROMOTING files are in the in-flight index, not " + stage);
+        }
+        return stage;
     }
 
     /** Sets {@code attribute} if it's missing, on a record past the step that sets it. */
@@ -243,7 +290,8 @@ public class FileRepository {
                 instant(item, "scannedAt"),
                 instant(item, "availableAt"),
                 item.containsKey("scanResult") ? ScanResult.valueOf(item.get("scanResult").s()) : null,
-                item.containsKey("reason") ? item.get("reason").s() : null);
+                item.containsKey("reason") ? item.get("reason").s() : null,
+                item.containsKey("scannedETag") ? item.get("scannedETag").s() : null);
     }
 
     private static Instant instant(Map<String, AttributeValue> item, String name) {

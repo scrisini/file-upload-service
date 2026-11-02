@@ -55,7 +55,8 @@ class ScanOutcomesTests {
 
     static FileRecord file(FileStatus status, ScanResult result, Instant availableAt) {
         return new FileRecord(ID, "a.png", FileType.PNG, 8, UploadMethod.PRESIGNED_URL, status, LANDED.minusSeconds(5),
-                LANDED, result == null ? null : SCANNED, availableAt, result, null);
+                LANDED, result == null ? null : SCANNED, availableAt, result, null,
+                result == null ? null : "etag-1");
     }
 
     static ScanEvent.ScanCompleted result(ScanResult result, String reason) {
@@ -73,7 +74,7 @@ class ScanOutcomesTests {
 
     @Test
     void aCleanFileIsCheckedAndPromoted() {
-        when(files.recordScan(ID, ScanResult.NO_THREATS_FOUND, SCANNED, null))
+        when(files.recordScan(ID, ScanResult.NO_THREATS_FOUND, SCANNED, null, "etag-1"))
                 .thenReturn(Optional.of(new Update(true, file(FileStatus.PROMOTING, ScanResult.NO_THREATS_FOUND, null))));
         when(storage.readSignature(ID)).thenReturn(Optional.of(PNG));
         when(storage.promote(ID, FileType.PNG, "etag-1")).thenReturn(Promotion.COPIED);
@@ -91,7 +92,7 @@ class ScanOutcomesTests {
 
     @Test
     void anInfectedFileStaysInQuarantine() {
-        when(files.recordScan(ID, ScanResult.THREATS_FOUND, SCANNED, "EICAR-Test-File"))
+        when(files.recordScan(ID, ScanResult.THREATS_FOUND, SCANNED, "EICAR-Test-File", "etag-1"))
                 .thenReturn(Optional.of(new Update(true, file(FileStatus.INFECTED, ScanResult.THREATS_FOUND, null))));
 
         outcomes.handle(result(ScanResult.THREATS_FOUND, "EICAR-Test-File"));
@@ -102,7 +103,7 @@ class ScanOutcomesTests {
 
     @Test
     void aCleanFileOfTheWrongTypeIsRejected() {
-        when(files.recordScan(any(), any(), any(), any()))
+        when(files.recordScan(any(), any(), any(), any(), any()))
                 .thenReturn(Optional.of(new Update(true, file(FileStatus.PROMOTING, ScanResult.NO_THREATS_FOUND, null))));
         when(storage.readSignature(ID)).thenReturn(Optional.of("%PDF-1.7".getBytes()));
         when(files.finishPromotion(eq(ID), eq(FileStatus.REJECTED), any(), any())).thenReturn(Optional.empty());
@@ -116,7 +117,7 @@ class ScanOutcomesTests {
     @Test
     void aRedeliveryFinishesAPromotionThatFailedHalfway() {
         // the earlier delivery recorded the result and copied the file, then failed before finishing
-        when(files.recordScan(any(), any(), any(), any()))
+        when(files.recordScan(any(), any(), any(), any(), any()))
                 .thenReturn(Optional.of(new Update(false, file(FileStatus.PROMOTING, ScanResult.NO_THREATS_FOUND, null))));
         when(storage.readSignature(ID)).thenReturn(Optional.empty());
         when(storage.isPromoted(ID)).thenReturn(true);
@@ -131,7 +132,7 @@ class ScanOutcomesTests {
 
     @Test
     void aRedeliveryAfterTheFileIsFinishedChangesNothing() {
-        when(files.recordScan(any(), any(), any(), any()))
+        when(files.recordScan(any(), any(), any(), any(), any()))
                 .thenReturn(Optional.of(new Update(false, file(FileStatus.AVAILABLE, ScanResult.NO_THREATS_FOUND, NOW))));
 
         outcomes.handle(result(ScanResult.NO_THREATS_FOUND, null));
@@ -142,7 +143,7 @@ class ScanOutcomesTests {
 
     @Test
     void aFileReplacedAfterItsScanIsRejected() {
-        when(files.recordScan(any(), any(), any(), any()))
+        when(files.recordScan(any(), any(), any(), any(), any()))
                 .thenReturn(Optional.of(new Update(true, file(FileStatus.PROMOTING, ScanResult.NO_THREATS_FOUND, null))));
         when(storage.readSignature(ID)).thenReturn(Optional.of(PNG));
         when(storage.promote(ID, FileType.PNG, "etag-1")).thenReturn(Promotion.SOURCE_CHANGED);
@@ -159,14 +160,50 @@ class ScanOutcomesTests {
                 .isEqualTo(ScanOutcomes.Outcome.UNKNOWN_FILE);
         assertThat(outcomes.handle(new ScanEvent.ObjectCreated(BUCKET, "uploads/readme.txt", 1, "e", LANDED)))
                 .isEqualTo(ScanOutcomes.Outcome.UNKNOWN_FILE);
-        when(files.recordScan(any(), any(), any(), any())).thenReturn(Optional.empty());
+        when(files.recordScan(any(), any(), any(), any(), any())).thenReturn(Optional.empty());
         assertThat(outcomes.handle(result(ScanResult.FAILED, null))).isEqualTo(ScanOutcomes.Outcome.UNKNOWN_FILE);
         verify(files, never()).markSubmitted(any(), any());
     }
 
     @Test
+    void aPromotionCanBeFinishedFromTheRecordAloneWithTheVersionScanned() {
+        when(storage.readSignature(ID)).thenReturn(Optional.of(PNG));
+        when(storage.promote(ID, FileType.PNG, "etag-1")).thenReturn(Promotion.COPIED);
+        when(files.finishPromotion(any(), any(), any(), any())).thenReturn(Optional.empty());
+
+        outcomes.resumePromotion(file(FileStatus.PROMOTING, ScanResult.NO_THREATS_FOUND, null));
+
+        verify(storage).promote(ID, FileType.PNG, "etag-1");
+        verify(files).finishPromotion(ID, FileStatus.AVAILABLE, NOW, null);
+    }
+
+    @Test
+    void resumingAFinishedFileDoesNothing() {
+        outcomes.resumePromotion(file(FileStatus.AVAILABLE, ScanResult.NO_THREATS_FOUND, NOW));
+
+        verify(storage, never()).readSignature(any());
+    }
+
+    @Test
+    void aResultRecoveredFromTheTagCarriesOnLikeTheEvent() {
+        when(files.recordScan(ID, ScanResult.NO_THREATS_FOUND, NOW, ScanOutcomes.RECOVERED_FROM_TAG, null))
+                .thenReturn(Optional.of(new Update(true, new FileRecord(ID, "a.png", FileType.PNG, 8, UploadMethod.STREAM,
+                        FileStatus.PROMOTING, LANDED, LANDED, NOW, null, ScanResult.NO_THREATS_FOUND,
+                        ScanOutcomes.RECOVERED_FROM_TAG, null))));
+        when(storage.readSignature(ID)).thenReturn(Optional.of(PNG));
+        when(storage.promote(ID, FileType.PNG, null)).thenReturn(Promotion.COPIED);
+        when(files.finishPromotion(any(), any(), any(), any())).thenReturn(Optional.empty());
+
+        outcomes.applyRecoveredResult(ID, ScanResult.NO_THREATS_FOUND, NOW);
+
+        // quarantine objects can't be replaced, so without the scanned ETag the copy is unconditional
+        verify(storage).promote(ID, FileType.PNG, null);
+        verify(files).finishPromotion(ID, FileStatus.AVAILABLE, NOW, null);
+    }
+
+    @Test
     void anUnscannableFileIsNeverPromoted() {
-        when(files.recordScan(ID, ScanResult.UNSUPPORTED, SCANNED, "PASSWORD_PROTECTED"))
+        when(files.recordScan(ID, ScanResult.UNSUPPORTED, SCANNED, "PASSWORD_PROTECTED", "etag-1"))
                 .thenReturn(Optional.of(new Update(true, file(FileStatus.NOT_SCANNED, ScanResult.UNSUPPORTED, null))));
 
         outcomes.handle(result(ScanResult.UNSUPPORTED, "PASSWORD_PROTECTED"));

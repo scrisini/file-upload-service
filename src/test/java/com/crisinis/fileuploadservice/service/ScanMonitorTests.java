@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import com.crisinis.fileuploadservice.model.FileStatus;
 import com.crisinis.fileuploadservice.model.ScanSummary;
 import com.crisinis.fileuploadservice.persistence.FileRepository;
 import com.crisinis.fileuploadservice.support.TestProperties;
@@ -38,7 +39,7 @@ class ScanMonitorTests {
     @Test
     void countsScansInProgressAndReportsEachOverdueScanOnce() {
         when(files.countScanning()).thenReturn(7L);
-        when(files.scanningSince(NOW.minus(Duration.ofMinutes(5)), 100)).thenReturn(List.of("a", "b"));
+        when(files.inStageSince(FileStatus.SCANNING, NOW.minus(Duration.ofMinutes(5)), 100)).thenReturn(List.of("a", "b"));
         when(files.claimOverdueReport("a", NOW)).thenReturn(true);
         when(files.claimOverdueReport("b", NOW)).thenReturn(false);  // another instance reported it
 
@@ -64,7 +65,7 @@ class ScanMonitorTests {
         monitor(Map.of()).refresh();
 
         verify(files, never()).countScanning();
-        verify(files, never()).scanningSince(any(), anyInt());
+        verify(files, never()).inStageSince(any(), any(), anyInt());
     }
 
     @Test
