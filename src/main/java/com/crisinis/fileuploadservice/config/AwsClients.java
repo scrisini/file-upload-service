@@ -11,6 +11,8 @@ import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
 import software.amazon.awssdk.http.SdkHttpClient;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
+import com.crisinis.fileuploadservice.extraction.SimulatedBedrock;
+import software.amazon.awssdk.services.bedrockruntime.BedrockRuntimeClient;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3Configuration;
@@ -79,6 +81,26 @@ class AwsClients {
     DynamoDbClient dynamoDbClient(FileUploadServiceProperties properties, SdkHttpClient http, AwsCallMetrics metrics) {
         FileUploadServiceProperties.Aws aws = properties.aws();
         return configure(DynamoDbClient.builder(), aws, aws.dynamodbEndpoint(), metrics).httpClient(http).build();
+    }
+
+    /**
+     * Bedrock Runtime for policy extraction, or the local simulator in its place. A model call has its
+     * own time limit ({@code extraction.timeout}): reading a document takes longer than other AWS calls.
+     */
+    @Bean(destroyMethod = "close")
+    BedrockRuntimeClient bedrockRuntimeClient(FileUploadServiceProperties properties, AwsCallMetrics metrics) {
+        FileUploadServiceProperties.Extraction extraction = properties.extraction();
+        if (extraction.simulator().enabled()) {
+            return new SimulatedBedrock(extraction.simulator().delay());
+        }
+        FileUploadServiceProperties.Aws aws = properties.aws();
+        return configure(BedrockRuntimeClient.builder(), aws, aws.bedrockEndpoint(), metrics, extraction.timeout())
+                // its own HTTP client (the SDK closes it): the shared one's 30 s read timeout is too short
+                // for a model reading a document
+                .httpClientBuilder(UrlConnectionHttpClient.builder()
+                        .connectionTimeout(Duration.ofSeconds(2))
+                        .socketTimeout(extraction.timeout().plusSeconds(5)))
+                .build();
     }
 
     private static <B extends AwsClientBuilder<B, ?>> B configure(B builder, FileUploadServiceProperties.Aws aws,

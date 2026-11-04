@@ -50,7 +50,7 @@ class IdempotentUploadTests {
 
     static FileRecord file(UploadMethod method, FileStatus status, String name, long size) {
         return new FileRecord(ID, name, FileType.PNG, size, method, status, NOW.minusSeconds(60),
-                status == FileStatus.AWAITING_UPLOAD ? null : NOW.minusSeconds(50), null, null, null, null, null);
+                status == FileStatus.AWAITING_UPLOAD ? null : NOW.minusSeconds(50), null, null, null, null, null, null);
     }
 
     // presigned style
@@ -62,7 +62,7 @@ class IdempotentUploadTests {
         when(storage.presignUpload(eq(ID), any(), anyLong(), any()))
                 .thenReturn(new PresignedUpload(URI.create("https://s3.example/x"), java.util.Map.of(), NOW));
 
-        UploadResult result = uploads.requestUpload("a.png", "image/png", 176, Optional.of(KEY));
+        UploadResult result = uploads.requestUpload(DeclaredFile.of("a.png", "image/png", 176), Optional.of(KEY));
 
         assertThat(result.file().id()).isEqualTo(ID);
         assertThat(result.replayed()).isTrue();
@@ -74,7 +74,7 @@ class IdempotentUploadTests {
         when(files.createIfAbsent(any())).thenReturn(new Update(false,
                 file(UploadMethod.PRESIGNED_URL, FileStatus.SCANNING, "a.png", 176)));
 
-        UploadResult result = uploads.requestUpload("a.png", "image/png", 176, Optional.of(KEY));
+        UploadResult result = uploads.requestUpload(DeclaredFile.of("a.png", "image/png", 176), Optional.of(KEY));
 
         assertThat(result.replayed()).isTrue();
         assertThat(result.upload()).isNull();
@@ -86,13 +86,13 @@ class IdempotentUploadTests {
         when(files.createIfAbsent(any())).thenReturn(new Update(false,
                 file(UploadMethod.PRESIGNED_URL, FileStatus.AWAITING_UPLOAD, "a.png", 176)));
 
-        assertThatThrownBy(() -> uploads.requestUpload("a.png", "image/png", 999, Optional.of(KEY)))
+        assertThatThrownBy(() -> uploads.requestUpload(DeclaredFile.of("a.png", "image/png", 999), Optional.of(KEY)))
                 .isInstanceOfSatisfying(UploadRejectedException.class,
                         e -> assertThat(e.reason()).isEqualTo(Reason.IDEMPOTENCY_KEY_REUSED));
-        assertThatThrownBy(() -> uploads.requestUpload("b.png", "image/png", 176, Optional.of(KEY)))
+        assertThatThrownBy(() -> uploads.requestUpload(DeclaredFile.of("b.png", "image/png", 176), Optional.of(KEY)))
                 .isInstanceOf(UploadRejectedException.class);
         when(files.find(ID)).thenReturn(Optional.of(file(UploadMethod.PRESIGNED_URL, FileStatus.SCANNING, "a.png", PNG.length)));
-        assertThatThrownBy(() -> uploads.stream("a.png", "image/png", PNG.length, new ByteArrayInputStream(PNG), Optional.of(KEY)))
+        assertThatThrownBy(() -> uploads.stream(DeclaredFile.of("a.png", "image/png", PNG.length), new ByteArrayInputStream(PNG), Optional.of(KEY)))
                 .as("same file, other style").isInstanceOf(UploadRejectedException.class);
     }
 
@@ -103,7 +103,7 @@ class IdempotentUploadTests {
         when(files.find(ID)).thenReturn(Optional.of(file(UploadMethod.STREAM, FileStatus.AVAILABLE, "a.png", PNG.length)));
         InputStream body = mock(InputStream.class);
 
-        UploadResult result = uploads.stream("a.png", "image/png", PNG.length, body, Optional.of(KEY));
+        UploadResult result = uploads.stream(DeclaredFile.of("a.png", "image/png", PNG.length), body, Optional.of(KEY));
 
         assertThat(result.replayed()).isTrue();
         assertThat(result.file().status()).isEqualTo(FileStatus.AVAILABLE);
@@ -119,7 +119,7 @@ class IdempotentUploadTests {
         when(files.markSubmitted(eq(ID), any())).thenReturn(Optional.of(new Update(true,
                 file(UploadMethod.STREAM, FileStatus.SCANNING, "a.png", PNG.length))));
 
-        UploadResult result = uploads.stream("a.png", "image/png", PNG.length, new ByteArrayInputStream(PNG), Optional.of(KEY));
+        UploadResult result = uploads.stream(DeclaredFile.of("a.png", "image/png", PNG.length), new ByteArrayInputStream(PNG), Optional.of(KEY));
 
         verify(storage).store(eq(ID), eq(FileType.PNG), eq((long) PNG.length), any());
         assertThat(result.replayed()).as("this attempt stored it").isFalse();
@@ -135,7 +135,7 @@ class IdempotentUploadTests {
         when(files.markSubmitted(eq(ID), any())).thenReturn(Optional.of(new Update(true,
                 file(UploadMethod.STREAM, FileStatus.SCANNING, "a.png", PNG.length))));
 
-        UploadResult result = uploads.stream("a.png", "image/png", PNG.length, new ByteArrayInputStream(PNG), Optional.of(KEY));
+        UploadResult result = uploads.stream(DeclaredFile.of("a.png", "image/png", PNG.length), new ByteArrayInputStream(PNG), Optional.of(KEY));
 
         assertThat(result.replayed()).isTrue();
         assertThat(result.file().status()).isEqualTo(FileStatus.SCANNING);
@@ -150,8 +150,8 @@ class IdempotentUploadTests {
         doAnswer(call -> null).doThrow(new ObjectExistsException(ID)).when(storage).store(any(), any(), anyLong(), any());
         when(files.markSubmitted(eq(ID), any())).thenReturn(Optional.empty());
 
-        UploadResult first = uploads.stream("a.png", "image/png", PNG.length, new ByteArrayInputStream(PNG), Optional.of(KEY));
-        UploadResult second = uploads.stream("a.png", "image/png", PNG.length, new ByteArrayInputStream(PNG), Optional.of(KEY));
+        UploadResult first = uploads.stream(DeclaredFile.of("a.png", "image/png", PNG.length), new ByteArrayInputStream(PNG), Optional.of(KEY));
+        UploadResult second = uploads.stream(DeclaredFile.of("a.png", "image/png", PNG.length), new ByteArrayInputStream(PNG), Optional.of(KEY));
 
         assertThat(first.file().id()).isEqualTo(second.file().id()).isEqualTo(ID);
         assertThat(first.replayed()).isFalse();
@@ -163,7 +163,7 @@ class IdempotentUploadTests {
         when(files.createIfAbsent(any())).thenAnswer(call -> new Update(true, call.getArgument(0)));
         doThrow(new ObjectExistsException("x")).when(storage).store(any(), any(), anyLong(), any());
 
-        assertThatThrownBy(() -> uploads.stream("a.png", "image/png", PNG.length, new ByteArrayInputStream(PNG), Optional.empty()))
+        assertThatThrownBy(() -> uploads.stream(DeclaredFile.of("a.png", "image/png", PNG.length), new ByteArrayInputStream(PNG), Optional.empty()))
                 .isInstanceOf(ObjectExistsException.class);
     }
 }

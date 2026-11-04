@@ -28,6 +28,8 @@ dependencies {
     implementation("software.amazon.awssdk:s3")
     implementation("software.amazon.awssdk:sqs")
     implementation("software.amazon.awssdk:dynamodb")
+    // Policy extraction with a model on Amazon Bedrock (Converse API)
+    implementation("software.amazon.awssdk:bedrockruntime")
     implementation("software.amazon.awssdk:url-connection-client")
     // OpenAPI spec and Swagger UI (not in Spring Boot's BOM; 3.2.0 is built against Boot 4.1.2)
     implementation("org.springdoc:springdoc-openapi-starter-webmvc-ui:3.2.0")
@@ -52,5 +54,46 @@ configurations.configureEach {
 
 tasks.withType<Test> {
     useJUnitPlatform()
+}
+
+// Integration tests against REAL AWS (S3, DynamoDB, Bedrock, GuardDuty): src/integrationTest/java.
+// Never part of `test`, `check` or `build`; run them deliberately with `./gradlew integrationTest`
+// once an AWS account is configured (README "Testing against real AWS"). Unit tests stay offline.
+testing {
+    suites {
+        register<JvmTestSuite>("integrationTest") {
+            useJUnitJupiter()
+            targets.all {
+                testTask.configure {
+                    description = "Runs the integration tests against real AWS (needs FILE_UPLOAD_SERVICE_IT_* settings)"
+                    shouldRunAfter(tasks.named("test"))
+                    // a policy image is drawn in memory for the Bedrock test
+                    systemProperty("java.awt.headless", "true")
+                    // each run talks to AWS: never reuse an earlier result
+                    outputs.upToDateWhen { false }
+                    doFirst {
+                        val region = System.getenv("FILE_UPLOAD_SERVICE_IT_REGION")
+                        if (region.isNullOrBlank()) {
+                            throw GradleException(
+                                "integrationTest runs against real AWS and isn't configured. Set at least " +
+                                    "FILE_UPLOAD_SERVICE_IT_REGION and AWS credentials (AWS_PROFILE or the default chain), " +
+                                    "plus the resources each test needs: FILE_UPLOAD_SERVICE_IT_BEDROCK_MODEL_ID, " +
+                                    "FILE_UPLOAD_SERVICE_IT_QUARANTINE_BUCKET, FILE_UPLOAD_SERVICE_IT_CLEAN_BUCKET, " +
+                                    "FILE_UPLOAD_SERVICE_IT_TABLE (README \"Testing against real AWS\").")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The integration tests use the application's classes and dependencies, and the test libraries
+configurations["integrationTestImplementation"].extendsFrom(configurations.implementation.get(), configurations.testImplementation.get())
+configurations["integrationTestRuntimeOnly"].extendsFrom(configurations.testRuntimeOnly.get())
+dependencies {
+    "integrationTestImplementation"(project())
+    "integrationTestCompileOnly"("org.projectlombok:lombok")
+    "integrationTestAnnotationProcessor"("org.projectlombok:lombok")
 }
 

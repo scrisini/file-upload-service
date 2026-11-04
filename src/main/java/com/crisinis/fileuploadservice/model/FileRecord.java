@@ -17,6 +17,7 @@ import java.util.Optional;
  * @param scannedETag the ETag of the version GuardDuty scanned; null before, or when the result came
  *                    from the object's tag. Promotion copies only this version, so a promotion
  *                    interrupted by a crash can be finished from the record alone.
+ * @param extraction  what the file is to be extracted as once AVAILABLE; null when its uploader didn't opt in
  */
 public record FileRecord(
         String id,
@@ -31,13 +32,20 @@ public record FileRecord(
         Instant availableAt,
         ScanResult scanResult,
         String reason,
-        String scannedETag) {
+        String scannedETag,
+        ExtractionKind extraction) {
 
     /** A new file whose bytes haven't arrived yet. */
     public static FileRecord awaitingUpload(String id, String fileName, FileType type, long size,
                                             UploadMethod method, Instant createdAt) {
+        return awaitingUpload(id, fileName, type, size, method, createdAt, null);
+    }
+
+    /** A new file whose bytes haven't arrived yet, to be extracted as {@code extraction} once available. */
+    public static FileRecord awaitingUpload(String id, String fileName, FileType type, long size,
+                                            UploadMethod method, Instant createdAt, ExtractionKind extraction) {
         return new FileRecord(id, fileName, type, size, method, FileStatus.AWAITING_UPLOAD, createdAt,
-                null, null, null, null, null, null);
+                null, null, null, null, null, null, extraction);
     }
 
     /** How long GuardDuty took, from the object landing to the result; empty until both are known. */

@@ -19,6 +19,7 @@ class FileUploadServicePropertiesTests {
         assertThat(properties.uploads().allowedTypes()).containsExactly(FileType.values());
         assertThat(properties.scan().enabled()).isFalse();
         assertThat(properties.aws().overridden()).isFalse();
+        assertThat(properties.extraction().enabled()).as("no model: off").isFalse();
     }
 
     @Test
@@ -31,6 +32,9 @@ class FileUploadServicePropertiesTests {
         assertRefused("file-upload-service.uploads.url-ttl", "8d", "7d");
         assertRefused("file-upload-service.scan.queue-url", "scan-events", "queue's URL");
         assertRefused("file-upload-service.aws.s3-endpoint", "localhost:9090", "must be a URL");
+        assertRefused("file-upload-service.extraction.timeout", "90s", "file-upload-service.extraction.lease", "60s",
+                "longer than extraction.timeout");
+        assertRefused("file-upload-service.extraction.max-attempts", "0", "between 1 and 10");
     }
 
     @Test

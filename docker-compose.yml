@@ -27,6 +27,8 @@ services:
       # ...but presigned URLs go to browsers on this machine
       FILE_UPLOAD_SERVICE_S3_PRESIGN_ENDPOINT: http://localhost:9099
       FILE_UPLOAD_SERVICE_SCAN_SIMULATOR: "true"
+      FILE_UPLOAD_SERVICE_EXTRACTION_MODEL_ID: simulated-insurance-policy-model
+      FILE_UPLOAD_SERVICE_EXTRACTION_SIMULATOR: "true"
       AWS_ACCESS_KEY_ID: local
       AWS_SECRET_ACCESS_KEY: local
       # the image's launcher prints a memory report to stdout at exit (docs/deployment.md)

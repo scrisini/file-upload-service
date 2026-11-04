@@ -45,6 +45,12 @@ public enum LogEvent {
             "No scan queue configured: uploads are accepted but never scanned or promoted"),
     SCAN_SIMULATOR_ON("FILE_UPLOAD_SERVICE-1012", Level.WARN,
             "The GuardDuty simulator is on: scan results are invented locally, not real scans"),
+    EXTRACTION_STARTED("FILE_UPLOAD_SERVICE-1013", Level.INFO,
+            "Extraction workers started: opted-in files are read by the model on Bedrock once available"),
+    EXTRACTION_OFF("FILE_UPLOAD_SERVICE-1014", Level.INFO,
+            "No extraction model configured: uploads that opt in to extraction are refused"),
+    BEDROCK_SIMULATOR_ON("FILE_UPLOAD_SERVICE-1015", Level.WARN,
+            "The Bedrock simulator is on: extracted policies are invented locally, not read by the model"),
 
     UPLOAD_URL_ISSUED("FILE_UPLOAD_SERVICE-2001", Level.INFO,
             "Presigned upload URL issued; the file is scanned once the caller has uploaded it"),
@@ -72,6 +78,10 @@ public enum LogEvent {
             "A streamed file was stored but its status couldn't be updated; S3's event updates it, the caller got 202"),
     UPLOAD_REPLAYED("FILE_UPLOAD_SERVICE-2013", Level.INFO,
             "A retried upload with the same Idempotency-Key was answered with the file its first attempt created"),
+    EXTRACTION_COMPLETED("FILE_UPLOAD_SERVICE-2014", Level.INFO,
+            "The model read the policy in a file; the result is stored for internal readers"),
+    EXTRACTION_FAILED("FILE_UPLOAD_SERVICE-2015", Level.WARN,
+            "Extraction gave up on a file; the file itself is unaffected and stays available"),
 
     DEPENDENCY_UNAVAILABLE("FILE_UPLOAD_SERVICE-3001", Level.WARN,
             "An AWS call failed; the caller got HTTP 503 and may retry"),
@@ -87,6 +97,10 @@ public enum LogEvent {
             "Counting scans in progress failed; the gauge keeps its last value and the next run retries"),
     RECOVERY_FAILED("FILE_UPLOAD_SERVICE-3007", Level.WARN,
             "Finishing a file left in flight failed; the next recovery run tries again"),
+    EXTRACTION_RETRYING("FILE_UPLOAD_SERVICE-3008", Level.WARN,
+            "A model call failed temporarily; the extraction is retried after a wait"),
+    EXTRACTION_WORKER_FAILED("FILE_UPLOAD_SERVICE-3009", Level.WARN,
+            "An extraction worker couldn't reach DynamoDB or S3; it retries, and claimed work is taken over when its lease ends"),
 
     UNEXPECTED_ERROR("FILE_UPLOAD_SERVICE-9001", Level.ERROR,
             "Unexpected failure while handling a request; the caller got HTTP 500");

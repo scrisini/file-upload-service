@@ -43,7 +43,7 @@ class InFlightRecoveryTests {
 
     static FileRecord promoting() {
         return new FileRecord(ID, "a.png", FileType.PNG, 8, UploadMethod.STREAM, FileStatus.PROMOTING, NOW.minusSeconds(600),
-                NOW.minusSeconds(590), NOW.minusSeconds(580), null, ScanResult.NO_THREATS_FOUND, null, "etag-1");
+                NOW.minusSeconds(590), NOW.minusSeconds(580), null, ScanResult.NO_THREATS_FOUND, null, "etag-1", null);
     }
 
     @BeforeEach
@@ -53,7 +53,7 @@ class InFlightRecoveryTests {
 
     @Test
     void resumesAPromotionWhoseProcessDied() {
-        when(files.inStageSince(FileStatus.PROMOTING, NOW.minus(Duration.ofMinutes(2)), InFlightRecovery.BATCH))
+        when(files.inStageSince(FileRepository.Stage.PROMOTING, NOW.minus(Duration.ofMinutes(2)), InFlightRecovery.BATCH))
                 .thenReturn(List.of(ID));
         when(files.find(ID)).thenReturn(Optional.of(promoting()));
 
@@ -65,7 +65,7 @@ class InFlightRecoveryTests {
 
     @Test
     void leavesAPromotionThatFinishedMeanwhile() {
-        when(files.inStageSince(FileStatus.PROMOTING, NOW.minus(Duration.ofMinutes(2)), InFlightRecovery.BATCH))
+        when(files.inStageSince(FileRepository.Stage.PROMOTING, NOW.minus(Duration.ofMinutes(2)), InFlightRecovery.BATCH))
                 .thenReturn(List.of(ID));
         when(files.find(ID)).thenReturn(Optional.empty());
 
@@ -76,7 +76,7 @@ class InFlightRecoveryTests {
 
     @Test
     void appliesAResultGuardDutyTaggedWhenItsEventNeverArrived() {
-        when(files.inStageSince(FileStatus.SCANNING, NOW.minus(Duration.ofMinutes(5)), InFlightRecovery.BATCH))
+        when(files.inStageSince(FileRepository.Stage.SCANNING, NOW.minus(Duration.ofMinutes(5)), InFlightRecovery.BATCH))
                 .thenReturn(List.of(ID, "still-scanning"));
         when(storage.scanStatusTag(ID)).thenReturn(Optional.of("THREATS_FOUND"));
         when(storage.scanStatusTag("still-scanning")).thenReturn(Optional.empty());
@@ -90,7 +90,7 @@ class InFlightRecoveryTests {
 
     @Test
     void oneFilesFailureDoesntStopTheOthers() {
-        when(files.inStageSince(FileStatus.SCANNING, NOW.minus(Duration.ofMinutes(5)), InFlightRecovery.BATCH))
+        when(files.inStageSince(FileRepository.Stage.SCANNING, NOW.minus(Duration.ofMinutes(5)), InFlightRecovery.BATCH))
                 .thenReturn(List.of("broken", ID));
         when(storage.scanStatusTag("broken"))
                 .thenThrow(new DependencyUnavailableException("s3", "GetObjectTagging", new RuntimeException("timeout")));

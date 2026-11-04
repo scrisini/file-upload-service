@@ -11,6 +11,8 @@ import java.util.function.Supplier;
 
 import com.crisinis.fileuploadservice.config.FileUploadServiceProperties;
 import com.crisinis.fileuploadservice.model.FileRecord;
+import com.crisinis.fileuploadservice.model.ExtractionKind;
+import com.crisinis.fileuploadservice.model.ExtractionStatus;
 import com.crisinis.fileuploadservice.model.FileStatus;
 import com.crisinis.fileuploadservice.model.FileType;
 import com.crisinis.fileuploadservice.model.ScanResult;
@@ -62,6 +64,28 @@ public class FileRepository {
     public record Update(boolean changed, FileRecord file) {
     }
 
+    /**
+     * The work a file in flight waits for, kept in {@code stage} for the in-flight index. SCANNING
+     * and PROMOTING match the file's status; EXTRACTING is an AVAILABLE file whose extraction is
+     * PENDING.
+     */
+    public enum Stage {
+        SCANNING, PROMOTING, EXTRACTING
+    }
+
+    /**
+     * An extraction a worker claimed: the file, and which attempt this is (1 for the first).
+     */
+    public record Claim(FileRecord file, int attempt) {
+    }
+
+    /**
+     * An extraction as stored, for internal readers; the policy is the JSON the service wrote.
+     */
+    public record StoredExtraction(String fileId, FileStatus fileStatus, ExtractionKind kind, ExtractionStatus status, Instant requestedAt,
+                                   Instant completedAt, int attempts, String modelId, String policyJson, String failure) {
+    }
+
     private final DynamoDbClient dynamo;
     private final String table;
     private final Duration urlTtl;
@@ -91,6 +115,9 @@ public class FileRepository {
         item.put("method", s(file.method().name()));
         item.put("status", s(file.status().name()));
         item.put("createdAt", n(file.createdAt().toEpochMilli()));
+        if (file.extraction() != null) {
+            item.put("extraction", s(file.extraction().name()));
+        }
         item.put("expiresAt", n(file.createdAt().plus(urlTtl).plus(ABANDONED_AFTER).getEpochSecond()));
         try {
             call("PutItem", () -> dynamo.putItem(r -> r.tableName(table).item(item)
@@ -162,52 +189,149 @@ public class FileRepository {
         }
     }
 
-    /** PROMOTING ends: AVAILABLE (with the time) or REJECTED (with the reason). */
-    public Optional<Update> finishPromotion(String id, FileStatus outcome, Instant at, String reason) {
+    /**
+     * PROMOTING ends: AVAILABLE (with the time) or REJECTED (with the reason). An AVAILABLE file
+     * whose uploader opted in to extraction enters EXTRACTING in the same write, so no crash can lose
+     * the extraction between the two.
+     *
+     * @param extract whether the file is to be extracted once AVAILABLE
+     */
+    public Optional<Update> finishPromotion(String id, FileStatus outcome, Instant at, String reason, boolean extract) {
         if (outcome != FileStatus.AVAILABLE && outcome != FileStatus.REJECTED) {
             throw new IllegalArgumentException("a promotion ends AVAILABLE or REJECTED, not " + outcome);
         }
-        String set = outcome == FileStatus.AVAILABLE ? "SET #status = :outcome, availableAt = :value"
-                : "SET #status = :outcome, reason = :value";
-        AttributeValue value = outcome == FileStatus.AVAILABLE ? n(at.toEpochMilli()) : s(reason);
+        Map<String, AttributeValue> values = new HashMap<>(Map.of(":outcome", s(outcome.name()),
+                ":promoting", s(FileStatus.PROMOTING.name())));
+        String expression;
+        if (outcome == FileStatus.REJECTED) {
+            expression = "SET #status = :outcome, reason = :reason REMOVE stage, stageSince";
+            values.put(":reason", s(reason));
+        } else if (extract) {
+            expression = "SET #status = :outcome, availableAt = :at, stage = :extracting, stageSince = :at, "
+                    + "extractionStatus = :pending, extractionRequestedAt = :at, extractionAttempts = :zero";
+            values.putAll(Map.of(":at", n(at.toEpochMilli()), ":extracting", s(Stage.EXTRACTING.name()),
+                    ":pending", s(ExtractionStatus.PENDING.name()), ":zero", n(0)));
+        } else {
+            expression = "SET #status = :outcome, availableAt = :at REMOVE stage, stageSince";
+            values.put(":at", n(at.toEpochMilli()));
+        }
         try {
             return Optional.of(new Update(true, update("finishPromotion", UpdateItemRequest.builder().key(key(id))
-                    .updateExpression(set + " REMOVE stage, stageSince")
+                    .updateExpression(expression)
                     .conditionExpression("#status = :promoting")
-                    .expressionAttributeValues(Map.of(":outcome", s(outcome.name()), ":value", value,
-                            ":promoting", s(FileStatus.PROMOTING.name()))))));
+                    .expressionAttributeValues(values))));
         } catch (ConditionalCheckFailedException alreadyFinished) {
             return find(id).map(file -> new Update(false, file));
         }
     }
 
-    /** How many files are being scanned now, across all instances. Reads keys only, from the sparse index. */
-    public long countScanning() {
+    /**
+     * Claims a pending extraction for {@code lease}: no other worker takes it until the lease ends,
+     * and if this one dies, the lease ends and another does. Counts the attempt.
+     *
+     * @return the claim; empty if it's no longer pending or another worker holds it
+     */
+    public Optional<Claim> claimExtraction(String id, Instant now, Duration lease) {
+        try {
+            Map<String, AttributeValue> item = rawUpdate("claimExtraction", UpdateItemRequest.builder().key(key(id))
+                    .updateExpression("SET leaseUntil = :until ADD extractionAttempts :one")
+                    .conditionExpression("stage = :extracting AND (attribute_not_exists(leaseUntil) OR leaseUntil <= :now)")
+                    .expressionAttributeValues(Map.of(":until", n(now.plus(lease).toEpochMilli()), ":one", n(1),
+                            ":extracting", s(Stage.EXTRACTING.name()), ":now", n(now.toEpochMilli()))));
+            return Optional.of(new Claim(toRecord(item), Integer.parseInt(item.get("extractionAttempts").n())));
+        } catch (ConditionalCheckFailedException takenOrDone) {
+            return Optional.empty();
+        }
+    }
+
+    /** Stores the result and ends the extraction: COMPLETED. False if it had already ended. */
+    public boolean completeExtraction(String id, String modelId, String policyJson, Instant at) {
+        return endExtraction("completeExtraction", id, "extractionStatus = :status, extractionModel = :model, "
+                        + "extractionResult = :result, extractionCompletedAt = :at",
+                Map.of(":status", s(ExtractionStatus.COMPLETED.name()), ":model", s(modelId), ":result", s(policyJson),
+                        ":at", n(at.toEpochMilli())));
+    }
+
+    /** Ends the extraction: FAILED, saying why. False if it had already ended. */
+    public boolean failExtraction(String id, String failure, Instant at) {
+        return endExtraction("failExtraction", id, "extractionStatus = :status, extractionFailure = :failure, "
+                        + "extractionCompletedAt = :at",
+                Map.of(":status", s(ExtractionStatus.FAILED.name()), ":failure", s(failure), ":at", n(at.toEpochMilli())));
+    }
+
+    /** After a temporary failure: no worker retries the extraction before {@code retryAt}. */
+    public void deferExtraction(String id, Instant retryAt, String lastError) {
+        try {
+            rawUpdate("deferExtraction", UpdateItemRequest.builder().key(key(id))
+                    .updateExpression("SET leaseUntil = :retry, extractionLastError = :error")
+                    .conditionExpression("stage = :extracting")
+                    .expressionAttributeValues(Map.of(":retry", n(retryAt.toEpochMilli()), ":error", s(lastError),
+                            ":extracting", s(Stage.EXTRACTING.name()))));
+        } catch (ConditionalCheckFailedException ended) {
+            // another worker finished it meanwhile: nothing to defer
+        }
+    }
+
+    /** The file's extraction; empty if the file doesn't exist or wasn't to be extracted. */
+    public Optional<StoredExtraction> findExtraction(String id) {
+        Map<String, AttributeValue> item = call("GetItem",
+                () -> dynamo.getItem(r -> r.tableName(table).key(key(id)).consistentRead(true))).item();
+        if (item == null || !item.containsKey("extraction")) {
+            return Optional.empty();
+        }
+        return Optional.of(new StoredExtraction(id, FileStatus.valueOf(item.get("status").s()),
+                ExtractionKind.valueOf(item.get("extraction").s()),
+                item.containsKey("extractionStatus") ? ExtractionStatus.valueOf(item.get("extractionStatus").s()) : null,
+                instant(item, "extractionRequestedAt"), instant(item, "extractionCompletedAt"),
+                item.containsKey("extractionAttempts") ? Integer.parseInt(item.get("extractionAttempts").n()) : 0,
+                string(item, "extractionModel"), string(item, "extractionResult"), string(item, "extractionFailure")));
+    }
+
+    /** How many files wait in {@code stage}, across all instances. Reads keys only, from the sparse index. */
+    public long countInStage(Stage stage) {
         long count = 0;
         Map<String, AttributeValue> start = null;
         do {
-            QueryResponse page = query("countScanning",
-                    stageQuery(FileStatus.SCANNING).select(Select.COUNT).exclusiveStartKey(start));
+            QueryResponse page = query("countInStage", stageQuery(stage).select(Select.COUNT).exclusiveStartKey(start));
             count += page.count();
             start = page.hasLastEvaluatedKey() && !page.lastEvaluatedKey().isEmpty() ? page.lastEvaluatedKey() : null;
         } while (start != null);
         return count;
     }
 
+    private boolean endExtraction(String operation, String id, String set, Map<String, AttributeValue> values) {
+        Map<String, AttributeValue> all = new HashMap<>(values);
+        all.put(":extracting", s(Stage.EXTRACTING.name()));
+        try {
+            rawUpdate(operation, UpdateItemRequest.builder().key(key(id))
+                    .updateExpression("SET " + set + " REMOVE stage, stageSince, leaseUntil")
+                    .conditionExpression("stage = :extracting")
+                    .expressionAttributeValues(all));
+            return true;
+        } catch (ConditionalCheckFailedException ended) {
+            return false;
+        }
+    }
+
+    /** How many files are being scanned now, across all instances. Reads keys only, from the sparse index. */
+    public long countScanning() {
+        return countInStage(Stage.SCANNING);
+    }
+
     /** When the longest-waiting scan started; empty when none is in progress. */
     public Optional<Instant> oldestScanning() {
-        QueryResponse page = query("oldestScanning", stageQuery(FileStatus.SCANNING).limit(1));
+        QueryResponse page = query("oldestScanning", stageQuery(Stage.SCANNING).limit(1));
         return page.items().stream().findFirst().map(item -> instant(item, "stageSince"));
     }
 
     /**
-     * Up to {@code limit} files that entered {@code stage} (SCANNING or PROMOTING) before {@code cutoff}
-     * and are still in it, oldest first: overdue scans, and promotions a crash interrupted.
+     * Up to {@code limit} files that entered {@code stage} before {@code cutoff} and are still in it,
+     * oldest first: overdue scans, promotions a crash interrupted, extractions waiting for a worker.
      */
-    public List<String> inStageSince(FileStatus stage, Instant cutoff, int limit) {
+    public List<String> inStageSince(Stage stage, Instant cutoff, int limit) {
         QueryResponse page = query("inStageSince", QueryRequest.builder().tableName(table).indexName(IN_FLIGHT_INDEX)
                 .keyConditionExpression("stage = :stage AND stageSince < :cutoff")
-                .expressionAttributeValues(Map.of(":stage", s(inFlight(stage).name()), ":cutoff", n(cutoff.toEpochMilli())))
+                .expressionAttributeValues(Map.of(":stage", s(stage.name()), ":cutoff", n(cutoff.toEpochMilli())))
                 .limit(limit));
         List<String> ids = new ArrayList<>(page.items().size());
         for (Map<String, AttributeValue> item : page.items()) {
@@ -230,18 +354,11 @@ public class FileRepository {
         }
     }
 
-    private QueryRequest.Builder stageQuery(FileStatus stage) {
+    private QueryRequest.Builder stageQuery(Stage stage) {
         return QueryRequest.builder().tableName(table).indexName(IN_FLIGHT_INDEX)
                 .keyConditionExpression("stage = :stage")
-                .expressionAttributeValues(Map.of(":stage", s(inFlight(stage).name())))
+                .expressionAttributeValues(Map.of(":stage", s(stage.name())))
                 .scanIndexForward(true);
-    }
-
-    private static FileStatus inFlight(FileStatus stage) {
-        if (stage != FileStatus.SCANNING && stage != FileStatus.PROMOTING) {
-            throw new IllegalArgumentException("only SCANNING and PROMOTING files are in the in-flight index, not " + stage);
-        }
-        return stage;
     }
 
     /** Sets {@code attribute} if it's missing, on a record past the step that sets it. */
@@ -261,6 +378,12 @@ public class FileRepository {
         UpdateItemRequest built = request.tableName(table).returnValues(ReturnValue.ALL_NEW)
                 .expressionAttributeNames(Map.of("#status", "status")).build();
         return toRecord(call(operation, () -> dynamo.updateItem(built)).attributes());
+    }
+
+    /** An update whose expressions don't name {@code #status}; returns the item as it is now. */
+    private Map<String, AttributeValue> rawUpdate(String operation, UpdateItemRequest.Builder request) {
+        UpdateItemRequest built = request.tableName(table).returnValues(ReturnValue.ALL_NEW).build();
+        return call(operation, () -> dynamo.updateItem(built)).attributes();
     }
 
     private QueryResponse query(String operation, QueryRequest.Builder request) {
@@ -291,7 +414,13 @@ public class FileRepository {
                 instant(item, "availableAt"),
                 item.containsKey("scanResult") ? ScanResult.valueOf(item.get("scanResult").s()) : null,
                 item.containsKey("reason") ? item.get("reason").s() : null,
-                item.containsKey("scannedETag") ? item.get("scannedETag").s() : null);
+                item.containsKey("scannedETag") ? item.get("scannedETag").s() : null,
+                item.containsKey("extraction") ? ExtractionKind.valueOf(item.get("extraction").s()) : null);
+    }
+
+    private static String string(Map<String, AttributeValue> item, String name) {
+        AttributeValue value = item.get(name);
+        return value == null ? null : value.s();
     }
 
     private static Instant instant(Map<String, AttributeValue> item, String name) {

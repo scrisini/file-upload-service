@@ -41,7 +41,9 @@ Suggested alerts:
   [2009](#file_upload_service-2009));
 - p95 of `file-upload-service.events.wait` above 30 s (the queue is backing up: [3005](#file_upload_service-3005));
 - any message in the scan queue's dead-letter queue ([3002](#file_upload_service-3002));
-- [FILE_UPLOAD_SERVICE-2007](#file_upload_service-2007) with `ACCESS_DENIED` (GuardDuty can't read the bucket: every upload is affected).
+- [FILE_UPLOAD_SERVICE-2007](#file_upload_service-2007) with `ACCESS_DENIED` (GuardDuty can't read the bucket: every upload is affected);
+- [FILE_UPLOAD_SERVICE-2015](#file_upload_service-2015) with `MODEL_ACCESS_DENIED` or `MODEL_NOT_FOUND`, or more than a few an hour;
+  `file-upload-service.extraction.pending` growing for 15 minutes (extraction is falling behind).
 
 ## When to escalate to developers
 
@@ -157,6 +159,29 @@ the full log lines for that request id (including `error.stack_trace`).
   containing the EICAR test string is "infected", anything else "clean". No file is really scanned.
   Production mode refuses to start with it on ([1005](#file_upload_service-1005)).
 - **Check:** outside a laptop, set `FILE_UPLOAD_SERVICE_SCAN_SIMULATOR=false` at once.
+
+<a id="file_upload_service-1013"></a>
+### FILE_UPLOAD_SERVICE-1013: Extraction workers started
+
+- **Level:** INFO. Normal at startup, once per instance, when a model is configured.
+- **Means:** `file-upload-service.concurrency` workers on this instance read opted-in files with the model
+  `file-upload-service.model` on Amazon Bedrock once they're available (README "Policy extraction").
+
+<a id="file_upload_service-1014"></a>
+### FILE_UPLOAD_SERVICE-1014: No extraction model configured
+
+- **Level:** INFO.
+- **Means:** `FILE_UPLOAD_SERVICE_EXTRACTION_MODEL_ID` is blank, so extraction is off: uploads that
+  opt in (`extract`) are refused with 422 `EXTRACTION_NOT_SUPPORTED`. Everything else works.
+- **Check:** if extraction should run, set the model's id or ARN in Parameter Store and restart.
+
+<a id="file_upload_service-1015"></a>
+### FILE_UPLOAD_SERVICE-1015: The Bedrock simulator is on
+
+- **Level:** WARN. Expected with `scripts/dev.sh run`; never anywhere else.
+- **Means:** extracted policies are invented by the service (`SimulatedBedrock`), not read by the
+  model. Production mode refuses to start with it on ([1005](#file_upload_service-1005)).
+- **Check:** outside a laptop, set `FILE_UPLOAD_SERVICE_EXTRACTION_SIMULATOR=false` at once.
 
 ## Uploads and scans (2xxx)
 
@@ -304,6 +329,31 @@ it to see one file's whole history. `GET /api/v1/files/<id>` shows its status an
 - **Check:** nothing, unless one key repeats many times a minute: a client stuck retrying a request
   that keeps failing for it (look for its 4xx, [2003](#file_upload_service-2003)).
 
+<a id="file_upload_service-2014"></a>
+### FILE_UPLOAD_SERVICE-2014: A policy was extracted
+
+- **Level:** INFO. One per opted-in file that became available.
+- **Means:** the model `file-upload-service.model` read the file `file-upload-service.file_id` on attempt `file-upload-service.attempt`;
+  `file-upload-service.fields_found` fields have a value and `file-upload-service.warnings` values were dropped as invalid. Tokens
+  used: `file-upload-service.input_tokens`, `file-upload-service.output_tokens` (cost). The policy itself is personal data
+  and is never logged: internal systems read it from `GET /internal/v1/files/<id>/extraction`.
+- **Check:** `fields_found` near 0 for most files means the model isn't reading the documents (wrong
+  model, or uploads that aren't policies).
+
+<a id="file_upload_service-2015"></a>
+### FILE_UPLOAD_SERVICE-2015: Extraction gave up on a file
+
+- **Level:** WARN.
+- **Means:** the file `file-upload-service.file_id` is still available, but its policy wasn't extracted.
+  `file-upload-service.reason`: `MODEL_ACCESS_DENIED` or `MODEL_NOT_FOUND` (configuration: every file fails),
+  `MODEL_REFUSED_REQUEST` (Bedrock rejected this document, e.g. over 8000 px), `ANSWER_TRUNCATED`
+  (raise `extraction.max-tokens`), `FILE_MISSING`, `ATTEMPTS_EXHAUSTED`, or the last temporary reason
+  after `file-upload-service.attempts` attempts (`MODEL_THROTTLED`, `MODEL_TIMEOUT`, `ANSWER_NOT_JSON`…).
+- **Check:** `MODEL_ACCESS_DENIED`/`MODEL_NOT_FOUND`: the model id in Parameter Store and the role's
+  `bedrock:InvokeModel` on it (docs/deployment.md "AWS resources"). Throttling: the model's quota or
+  provisioned throughput, and `extraction.concurrency` × instances. There's no automatic re-run: ask
+  the developers to reset the file's extraction once the cause is fixed.
+
 ## Dependencies (3xxx)
 
 <a id="file_upload_service-3001"></a>
@@ -373,6 +423,24 @@ it to see one file's whole history. `GET /api/v1/files/<id>` shows its status an
   `file-upload-service.file_id` in `file-upload-service.stage` (no file id: it couldn't read the in-flight index). `error.*` says
   which dependency failed. The next run, a minute later, tries again.
 - **Check:** as [3001](#file_upload_service-3001). Repeating for one file only: escalate with its id.
+
+<a id="file_upload_service-3008"></a>
+### FILE_UPLOAD_SERVICE-3008: A model call failed temporarily
+
+- **Level:** WARN. Recovers by itself.
+- **Means:** extracting `file-upload-service.file_id` failed with `file-upload-service.reason` on attempt `file-upload-service.attempt`; it's retried
+  at `file-upload-service.retry_at` (`extraction.retry-backoff` × attempt), up to `extraction.max-attempts`, then
+  [2015](#file_upload_service-2015).
+- **Check:** many `MODEL_THROTTLED`: the model's quota or throughput is too small for the load; lower
+  `extraction.concurrency` or raise the quota. `BEDROCK_UNREACHABLE`: the Bedrock Runtime VPC endpoint.
+
+<a id="file_upload_service-3009"></a>
+### FILE_UPLOAD_SERVICE-3009: An extraction worker couldn't reach DynamoDB or S3
+
+- **Level:** WARN. Recovers by itself.
+- **Means:** a worker failed `file-upload-service.operation`; it waits and tries again. A file it had claimed is
+  taken over by any worker when the claim's lease ends (`extraction.lease`).
+- **Check:** as [3001](#file_upload_service-3001).
 
 ## Unexpected failures (9xxx)
 
