@@ -24,6 +24,14 @@ promotes clean files. README "File lifecycle" has the states.
 - **Retries are idempotent** (`Idempotency-Key`, README "Idempotent retries"): the key decides the
   file id, so creation is `createIfAbsent` and a write to quarantine that finds an object
   (`If-None-Match`) is a replay, not an error. Keep both upload styles that way.
+- **Policy extraction** (README "Policy extraction"): opt-in per upload; runs only on AVAILABLE
+  files; workers claim with DynamoDB leases (stage `EXTRACTING` in the in-flight index). **Extracted
+  values are personal data: never log them**, only counts. The model is called with Converse; keep
+  Bedrock's format and size limits in `BedrockPolicyModel.refusal` so uploads are refused up front.
+- **Tests never call AWS.** `./gradlew test` mocks the AWS SDK (Bedrock included: mock
+  `BedrockRuntimeClient`). Real-AWS checks go in `src/integrationTest/java` (`./gradlew
+  integrationTest`), need `FILE_UPLOAD_SERVICE_IT_*` settings, fail when one they need is missing, and
+  clean up what they create.
 - **`docs/test-scenarios.md` is the testers' catalogue.** A change in behaviour updates its rows
   (and adds rows for new behaviour) in the same pull request.
 - **Every status change is a conditional write** that only moves forward; events are at-least-once
@@ -52,6 +60,7 @@ scripts/dev.sh run [args...]   # start dependencies, then the app on :8080 (asks
 scripts/dev.sh docker [args...] # the same with the app in Docker, built as production builds it
 scripts/try-upload.sh presigned|stream <file>   # upload and follow it (IDEMPOTENCY_KEY=… replays)
 scripts/send-scan-event.sh ...  # inject S3/GuardDuty events into the local queue (simulator off)
+./gradlew integrationTest      # against REAL AWS; needs FILE_UPLOAD_SERVICE_IT_* (README "Testing against real AWS")
 scripts/dev.sh status          # dependency and app health
 scripts/dev.sh hooks           # install the git hooks: commit messages, plaintext secrets (once per clone)
 scripts/test-commit-msg.sh     # test the hook after changing it or .commitlintrc.json

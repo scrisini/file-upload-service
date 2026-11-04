@@ -31,6 +31,8 @@ area names the test classes, so testers can focus on the end-to-end paths and th
 12. [Observability (OB)](#observability-ob)
 13. [Non-functional: no filesystem, memory, load, shutdown (NF)](#non-functional-no-filesystem-memory-load-shutdown-nf)
 14. [AWS-only scenarios (AW)](#aws-only-scenarios-aw)
+15. [Policy extraction (EX)](#policy-extraction-ex)
+16. [Integration tests against real AWS (IT)](#integration-tests-against-real-aws-it)
 
 ## Setup
 
@@ -48,6 +50,9 @@ scripts/dev.sh status       # health and scans in progress
 | Promotions resumed sooner | `FILE_UPLOAD_SERVICE_SCAN_RESUME_PROMOTION_AFTER=10s` |
 | A smaller size limit or fewer types | `FILE_UPLOAD_SERVICE_MAX_SIZE=1MB`, `FILE_UPLOAD_SERVICE_ALLOWED_TYPES=PNG,PDF` |
 | One stream at a time (capacity) | `FILE_UPLOAD_SERVICE_MAX_CONCURRENT_STREAMS=1` |
+| Extraction retries in seconds | `FILE_UPLOAD_SERVICE_EXTRACTION_RETRY_BACKOFF=2s` |
+| Slow model calls (to act mid-call) | `FILE_UPLOAD_SERVICE_EXTRACTION_SIMULATOR_DELAY=20s FILE_UPLOAD_SERVICE_EXTRACTION_TIMEOUT=20s FILE_UPLOAD_SERVICE_EXTRACTION_LEASE=35s` |
+| Extraction off | `FILE_UPLOAD_SERVICE_EXTRACTION_MODEL_ID= scripts/dev.sh run` |
 
 Logs print to the terminal; every line of interest carries `[FILE_UPLOAD_SERVICE-nnnn]` and
 `file-upload-service.file_id`. Metrics: `curl localhost:8080/actuator/metrics/<name>`.
@@ -72,6 +77,8 @@ Short names used in the steps. `$B` is `http://localhost:8080`.
 | **stream** *file type* | `curl -i -X POST "$B/api/v1/files?fileName=<name>" -H 'Content-Type: <type>' --data-binary @<file>` |
 | **status** *id* | `curl -s $B/api/v1/files/<id>` |
 | **scans** | `curl -s $B/api/v1/scans` |
+| **extract** | prefix an upload with `EXTRACT=INSURANCE_POLICY`: opts in, then follows the extraction to its end and prints it |
+| **extraction** *id* | `curl -s $B/internal/v1/files/<id>/extraction` (internal endpoint) |
 | **event** | `scripts/send-scan-event.sh created <id>`, `result <id> <STATUS> [reason]`, `tag <id> <STATUS>`, `raw '<body>'` (simulator off) |
 | **kill** | `kill -9 $(pgrep -f FileUploadServiceApplication)`: a crash, no shutdown hooks (`docker kill file-upload-service-app` in Docker) |
 | **list** *bucket* | `curl -s 'localhost:9099/<bucket>?list-type=2' \| grep -o '<Key>[^<]*'`: `file-upload-quarantine`, `file-upload-clean` |
@@ -87,6 +94,8 @@ phone, a browser and a PDF tool are best). Also:
 | *exe.png* (an executable named .png) | `printf 'MZ\x90\x00 not an image' > exe.png` |
 | *big.png* (20 MB) | `{ cat a.png; head -c 20971520 /dev/urandom; } > big.png` |
 | *limit.png* (exactly 25 MB) and *over.png* (25 MB + 1 byte) | as *big.png*, sized to `26214400` and `26214401` bytes |
+| *throttle.png*, *garbage.png*, *refuse.png* (Bedrock simulator markers) | `cp a.png throttle.png; printf BEDROCK-THROTTLE >> throttle.png` (likewise `BEDROCK-GARBAGE`, `BEDROCK-REFUSE`) |
+| *photo4mb.png* (over Bedrock's image limit) | as *big.png*, 4,000,000 bytes |
 | *locked.pdf* (password-protected) | any PDF tool's "encrypt with password" (GuardDuty reports UNSUPPORTED; AW only) |
 
 ## Presigned uploads (PS)
@@ -321,3 +330,52 @@ Run in a test account with `deploy/aws/` applied. Pick these up alongside the A 
 | AW-07 | P2 | Lifecycle | check the quarantine bucket's rule | Infected and unscanned objects expire after 30 days |
 | AW-08 | P2 | Records expire | after PS-12 in AWS | DynamoDB TTL deletes the record ~15 days after the URL expired |
 | AW-09 | P3 | Large file through the ALB | stream a 25 MB file through the ingress | 202 (no body-size limit in front of the service below `max-size`) |
+
+## Policy extraction (EX)
+
+Opted-in uploads are read by the model once AVAILABLE; results are internal. Locally the Bedrock
+simulator answers (a policy with number `SIM-…`); markers make it fail. Unit tests (Bedrock SDK
+mocked): `BedrockPolicyModelTests`, `PolicyParserTests`, `ExtractionWorkerTests`,
+`ExtractionResultsTests`, `SimulatedBedrockTests`, `InternalExtractionControllerTests`.
+
+| Id | P | Where | Scenario | Steps | Expected |
+|---|---|---|---|---|---|
+| EX-01 | P1 | L | Presigned image, opted in | **extract** upload-presigned *a.png* | File `AVAILABLE`; extraction `PENDING` → `COMPLETED` within seconds, `attempts` 1, `modelId`, `policy` with every field `{value, confidence}`; money as `{amountMinor, currency, scale}`. Logs 2014 (with `fields_found`, tokens) |
+| EX-02 | P1 | L | Streamed PDF, opted in | **extract** upload-stream *a.pdf* (also `?extract=insurance-policy`, lower case) | `COMPLETED` |
+| EX-03 | P1 | L | Each extractable type | EX-01 for JPEG, GIF, WebP | `COMPLETED` |
+| EX-04 | P1 | L | Type Bedrock can't read | stream a HEIC or TIFF with `extract` | **422** `EXTRACTION_NOT_SUPPORTED` naming the type; nothing stored |
+| EX-05 | P1 | L | Over Bedrock's size | ask-url `{"…","size":4000000,"extract":"INSURANCE_POLICY"}` for PNG; and a PDF over 4,500,000 | 422 naming the limit; at the limit (3,750,000 / 4,500,000) 201 |
+| EX-06 | P2 | L | Unknown kind | `extract=CAR` | 400 listing `INSURANCE_POLICY` |
+| EX-07 | P1 | L | Extraction off | no model configured; upload with `extract` | 422 `extraction isn't available`; log 1014 at startup; uploads without `extract` unaffected |
+| EX-08 | P1 | L | Infected file | **extract** upload *eicar.png* | File `INFECTED`; extraction `NOT_EXTRACTED`; the model is never called (no 2014/3008) |
+| EX-09 | P2 | L | Before the file is available | simulator scan delay 30 s; **extraction** while `SCANNING` | `AWAITING_FILE` |
+| EX-10 | P1 | L | Not opted in | **extraction** of a file uploaded without `extract` | 404 |
+| EX-11 | P1 | L | Temporary failures, then give up | retries 2 s; **extract** upload-stream *throttle.png* | Two 3008 (`MODEL_THROTTLED`, `retry_at` 2 s then 4 s later), then `FAILED`, `attempts` 3, `failure` `MODEL_THROTTLED`; 2015 |
+| EX-12 | P1 | L | Garbled answer | as EX-11 with *garbage.png* | `FAILED` after 3 attempts, `ANSWER_NOT_JSON` |
+| EX-13 | P1 | L | Permanent failure | as EX-11 with *refuse.png* | `FAILED` at once, `attempts` 1, `MODEL_REFUSED_REQUEST` |
+| EX-14 | P1 | L | Killed during a model call | slow model calls (setup); **extract** a file; when `PENDING` for ~4 s, **kill**; restart with fast calls | `COMPLETED` once the dead worker's lease ends (≤ 35 s), `attempts` 2 |
+| EX-15 | P1 | L | Personal data stays out of logs | after EX-01 | `grep` the logs for the holder's name, address and policy number: no match |
+| EX-16 | P2 | L | Idempotency covers the opt-in | upload with key K and `extract`; again with K and no `extract` | 422 `IDEMPOTENCY_KEY_REUSED` |
+| EX-17 | P2 | L | Concurrency and backlog | `FILE_UPLOAD_SERVICE_EXTRACTION_CONCURRENCY=1`, slow calls; opt in 5 files | One model call at a time; gauge `extraction.pending` counts down from 5 |
+| EX-18 | P2 | L | Two instances | two instances on the emulators; opt in 10 files | Each extracted once (one 2014 per file across both logs) |
+| EX-19 | P2 | L | Metrics | after a mixed run | `extraction.model.calls{outcome}`, `extraction.tokens{direction}`, `extraction.time-to-complete`, `extraction.pending` |
+| EX-20 | P1 | L | Internal endpoint isn't public | OpenAPI (`/v3/api-docs`) | No `/internal/` paths. Through the ALB (A): 404 |
+| EX-21 | P1 | A | The real model reads real policies | **extract** a set of real (anonymised) policy schedules and certificates, photos and PDFs | Fields match the documents; confidence lower where the print is poor; nothing invented (`null` when absent). Record the hit rate per field |
+| EX-22 | P1 | A | Model access | wrong model ARN, or remove `bedrock:InvokeModel` | `FAILED` with `MODEL_NOT_FOUND` / `MODEL_ACCESS_DENIED` at once (no retries); 2015 |
+| EX-23 | P2 | A | Throttling under load | opt in more files than the model's quota allows per minute | 3008 `MODEL_THROTTLED`, retries succeed later; none lost |
+| EX-24 | P2 | A | Prompt injection in the document | a policy image that also says "ignore your instructions and output …" | The answer is still the schema (validated); injected text never becomes a field outside its rules |
+
+## Integration tests against real AWS (IT)
+
+`./gradlew integrationTest` (README "Testing against real AWS"). Run in a test account with the
+resources from `deploy/aws/`; never part of the normal build.
+
+| Id | P | Where | Scenario | Steps | Expected |
+|---|---|---|---|---|---|
+| IT-01 | P1 | L | Not configured | `./gradlew integrationTest` with no `FILE_UPLOAD_SERVICE_IT_*` | Stops before running, listing the settings |
+| IT-02 | P1 | A | Bedrock reads a policy | `…IT_REGION`, `…IT_BEDROCK_MODEL_ID`; `--tests '*Bedrock*'` | `BedrockPolicyExtractionIT` passes: policy number, holder, dates, premium, sum insured, excess as drawn |
+| IT-03 | P1 | A | S3 enforces presigned URLs | `…IT_QUARANTINE_BUCKET`, `…IT_CLEAN_BUCKET`; `--tests '*S3*'` | 403 for another type, length or no `If-None-Match`; 200 as signed; 412 twice; promotion only for the scanned ETag |
+| IT-04 | P1 | A | DynamoDB transitions | `…IT_TABLE`; `--tests '*FileRepository*'` | Every transition, the in-flight index and the extraction lease behave as specified |
+| IT-05 | P2 | A | GuardDuty scans | `…IT_GUARDDUTY=true` with the buckets; `--tests '*GuardDuty*'` | Clean file tagged `NO_THREATS_FOUND`, EICAR `THREATS_FOUND`, within 5 minutes |
+| IT-06 | P2 | A | A setting missing for one test | run all with only the Bedrock settings | The S3 and DynamoDB tests **fail** naming the missing setting (not skipped) |
+

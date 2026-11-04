@@ -188,6 +188,28 @@ public class FileStorage {
                 .key(quarantineKey(id)).tagging(g -> g.tagSet(Tag.builder().key(SCAN_STATUS_TAG).value(scanResultStatus).build()))));
     }
 
+    /**
+     * A clean file's bytes, for extraction; empty if it isn't there. Read whole into memory, so only
+     * for files Bedrock can take (at most {@code maxBytes}, checked at upload and again here).
+     *
+     * @throws IllegalStateException if the object is larger than {@code maxBytes}
+     */
+    public Optional<byte[]> readClean(String id, long maxBytes) {
+        try (ResponseInputStream<GetObjectResponse> in = s3.getObject(g -> g.bucket(storage.cleanBucket()).key(cleanKey(id)))) {
+            Long length = in.response().contentLength();
+            if (length != null && length > maxBytes) {
+                throw new IllegalStateException("clean object " + id + " is " + length + " bytes, more than " + maxBytes);
+            }
+            return Optional.of(in.readNBytes((int) maxBytes + 1));
+        } catch (NoSuchKeyException e) {
+            return Optional.empty();
+        } catch (IOException e) {
+            throw new DependencyUnavailableException("s3", "GetObject", new UncheckedIOException(e));
+        } catch (SdkException e) {
+            throw new DependencyUnavailableException("s3", "GetObject", e);
+        }
+    }
+
     /** Whether the file is in the clean bucket. */
     public boolean isPromoted(String id) {
         try {

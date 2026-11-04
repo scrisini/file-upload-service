@@ -211,11 +211,15 @@ use_local_aws() {
     export FILE_UPLOAD_SERVICE_DYNAMODB_ENDPOINT="${FILE_UPLOAD_SERVICE_DYNAMODB_ENDPOINT:-$LOCAL_DYNAMODB}"
     export FILE_UPLOAD_SERVICE_SCAN_QUEUE_URL="${FILE_UPLOAD_SERVICE_SCAN_QUEUE_URL:-$LOCAL_QUEUE_URL}"
     export FILE_UPLOAD_SERVICE_SCAN_SIMULATOR="${FILE_UPLOAD_SERVICE_SCAN_SIMULATOR:-true}"
+    # policy extraction against the Bedrock simulator (no AWS); a real model id with the simulator off
+    # would call Bedrock with your own credentials
+    export FILE_UPLOAD_SERVICE_EXTRACTION_MODEL_ID="${FILE_UPLOAD_SERVICE_EXTRACTION_MODEL_ID:-simulated-insurance-policy-model}"
+    export FILE_UPLOAD_SERVICE_EXTRACTION_SIMULATOR="${FILE_UPLOAD_SERVICE_EXTRACTION_SIMULATOR:-true}"
     # the emulators accept any credentials; these keep the SDK from looking for real ones
     export AWS_ACCESS_KEY_ID="${LOCAL_AWS_ACCESS_KEY_ID:-local}"
     export AWS_SECRET_ACCESS_KEY="${LOCAL_AWS_SECRET_ACCESS_KEY:-local}"
     unset AWS_SESSION_TOKEN AWS_PROFILE
-    ok "AWS services: local emulators; GuardDuty: simulated (EICAR test string = infected)"
+    ok "AWS services: local emulators; GuardDuty: simulated (EICAR test string = infected); Bedrock: simulated"
 }
 
 # A port number a user may pick: 1024-65535
@@ -285,7 +289,7 @@ cmd_docker() {
     ./gradlew bootBuildImage --imageName="$APP_IMAGE" --console=plain -q
     ok "image $APP_IMAGE built"
     step "Starting file-upload-service in Docker on http://localhost:$APP_PORT (Ctrl-C to stop)"
-    ok "AWS services: local emulators; GuardDuty: simulated (EICAR test string = infected)"
+    ok "AWS services: local emulators; GuardDuty: simulated (EICAR test string = infected); Bedrock: simulated"
     # in the foreground, like `run`; removed when it stops. Arguments go to Spring Boot.
     exec docker compose --profile app run --rm --service-ports --name "$APP_CONTAINER" app "$@"
 }

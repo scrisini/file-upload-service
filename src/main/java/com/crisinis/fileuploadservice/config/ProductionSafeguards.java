@@ -62,6 +62,10 @@ public class ProductionSafeguards {
             violations.add("springdoc.api-docs.enabled or springdoc.swagger-ui.enabled is on: the API's description "
                     + "and Swagger UI are for development (FILE_UPLOAD_SERVICE_API_DOCS=false)");
         }
+        if (properties.extraction().simulator().enabled()) {
+            violations.add("file-upload-service.extraction.simulator.enabled is on: it invents policies instead of "
+                    + "asking the model on Bedrock (FILE_UPLOAD_SERVICE_EXTRACTION_SIMULATOR)");
+        }
         if (properties.scan().simulator().enabled()) {
             violations.add("file-upload-service.scan.simulator.enabled is on: it invents scan results instead of "
                     + "GuardDuty's (FILE_UPLOAD_SERVICE_SCAN_SIMULATOR)");

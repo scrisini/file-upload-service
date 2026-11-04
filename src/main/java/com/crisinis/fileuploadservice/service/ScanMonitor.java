@@ -6,7 +6,6 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import com.crisinis.fileuploadservice.config.FileUploadServiceProperties;
 import com.crisinis.fileuploadservice.logging.LogEvent;
-import com.crisinis.fileuploadservice.model.FileStatus;
 import com.crisinis.fileuploadservice.model.ScanSummary;
 import com.crisinis.fileuploadservice.persistence.FileRepository;
 import io.micrometer.core.instrument.Counter;
@@ -34,6 +33,7 @@ public class ScanMonitor {
     private final FileUploadServiceProperties.Scan scan;
     private final Clock clock;
     private final AtomicLong inProgress = new AtomicLong();
+    private final AtomicLong extractionsPending = new AtomicLong();
     private final Counter overdue;
 
     public ScanMonitor(FileRepository files, FileUploadServiceProperties properties, Clock clock, MeterRegistry registry) {
@@ -42,6 +42,9 @@ public class ScanMonitor {
         this.clock = clock;
         Gauge.builder("file-upload-service.scan.in-progress", inProgress, AtomicLong::get)
                 .description("Files in quarantine waiting for GuardDuty's result, across all instances")
+                .register(registry);
+        Gauge.builder("file-upload-service.extraction.pending", extractionsPending, AtomicLong::get)
+                .description("Opted-in files available and waiting for, or in, extraction, across all instances")
                 .register(registry);
         this.overdue = Counter.builder("file-upload-service.scan.overdue")
                 .description("Scans with no result after scan.overdue-after").register(registry);
@@ -60,6 +63,7 @@ public class ScanMonitor {
         }
         try {
             inProgress.set(files.countScanning());
+            extractionsPending.set(files.countInStage(FileRepository.Stage.EXTRACTING));
             reportOverdue(clock.instant());
         } catch (DependencyUnavailableException e) {
             LogEvent.SCAN_MONITOR_FAILED.at(log).with("operation", e.operation()).cause(e).log();
@@ -67,7 +71,7 @@ public class ScanMonitor {
     }
 
     private void reportOverdue(Instant now) {
-        for (String id : files.inStageSince(FileStatus.SCANNING, now.minus(scan.overdueAfter()), OVERDUE_BATCH)) {
+        for (String id : files.inStageSince(FileRepository.Stage.SCANNING, now.minus(scan.overdueAfter()), OVERDUE_BATCH)) {
             if (files.claimOverdueReport(id, now)) {
                 overdue.increment();
                 LogEvent.SCAN_OVERDUE.at(log).with("file_id", id)

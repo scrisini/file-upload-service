@@ -93,6 +93,66 @@ class FileRepositoryTests {
     }
 
     @Test
+    void anOptedInFileIsHandedToExtractionInTheSameWriteThatMakesItAvailable() {
+        ArgumentCaptor<UpdateItemRequest> update = ArgumentCaptor.forClass(UpdateItemRequest.class);
+        when(dynamo.updateItem(update.capture())).thenReturn(UpdateItemResponse.builder().attributes(item(FileStatus.AVAILABLE)).build());
+
+        repository.finishPromotion(ID, FileStatus.AVAILABLE, AT, null, true);
+        repository.finishPromotion(ID, FileStatus.AVAILABLE, AT, null, false);
+
+        assertThat(update.getAllValues().get(0).updateExpression())
+                .contains("availableAt = :at").contains("stage = :extracting").contains("extractionStatus = :pending")
+                .doesNotContain("REMOVE");
+        assertThat(update.getAllValues().get(0).expressionAttributeValues())
+                .containsEntry(":extracting", AttributeValue.fromS("EXTRACTING"));
+        assertThat(update.getAllValues().get(1).updateExpression()).contains("REMOVE stage, stageSince")
+                .doesNotContain("extraction");
+    }
+
+    @Test
+    void aClaimTakesOnlyAnUnleasedExtractionAndCountsTheAttempt() {
+        ArgumentCaptor<UpdateItemRequest> update = ArgumentCaptor.forClass(UpdateItemRequest.class);
+        java.util.Map<String, AttributeValue> claimed = new java.util.HashMap<>(item(FileStatus.AVAILABLE));
+        claimed.put("extractionAttempts", AttributeValue.fromN("2"));
+        when(dynamo.updateItem(update.capture())).thenReturn(UpdateItemResponse.builder().attributes(claimed).build());
+
+        var claim = repository.claimExtraction(ID, AT, Duration.ofMinutes(3));
+
+        assertThat(claim).hasValueSatisfying(c -> assertThat(c.attempt()).isEqualTo(2));
+        assertThat(update.getValue().conditionExpression())
+                .isEqualTo("stage = :extracting AND (attribute_not_exists(leaseUntil) OR leaseUntil <= :now)");
+        assertThat(update.getValue().updateExpression()).contains("ADD extractionAttempts :one");
+        assertThat(update.getValue().expressionAttributeValues())
+                .containsEntry(":until", AttributeValue.fromN(Long.toString(AT.plus(Duration.ofMinutes(3)).toEpochMilli())));
+        assertThat(update.getValue().expressionAttributeNames()).isEmpty();
+    }
+
+    @Test
+    void aClaimOnAHeldOrFinishedExtractionGetsNothing() {
+        when(dynamo.updateItem(any(UpdateItemRequest.class)))
+                .thenThrow(ConditionalCheckFailedException.builder().message("held").build());
+
+        assertThat(repository.claimExtraction(ID, AT, Duration.ofMinutes(3))).isEmpty();
+        assertThat(repository.completeExtraction(ID, "m", "{}", AT)).isFalse();
+    }
+
+    @Test
+    void endingAnExtractionLeavesTheInFlightIndex() {
+        ArgumentCaptor<UpdateItemRequest> update = ArgumentCaptor.forClass(UpdateItemRequest.class);
+        when(dynamo.updateItem(update.capture())).thenReturn(UpdateItemResponse.builder().attributes(item(FileStatus.AVAILABLE)).build());
+
+        assertThat(repository.completeExtraction(ID, "model-1", "{\"a\":1}", AT)).isTrue();
+        assertThat(repository.failExtraction(ID, "MODEL_NOT_FOUND", AT)).isTrue();
+
+        assertThat(update.getAllValues()).allSatisfy(u -> {
+            assertThat(u.updateExpression()).endsWith("REMOVE stage, stageSince, leaseUntil");
+            assertThat(u.conditionExpression()).isEqualTo("stage = :extracting");
+        });
+        assertThat(update.getAllValues().get(0).expressionAttributeValues()).containsEntry(":status", AttributeValue.fromS("COMPLETED"));
+        assertThat(update.getAllValues().get(1).expressionAttributeValues()).containsEntry(":failure", AttributeValue.fromS("MODEL_NOT_FOUND"));
+    }
+
+    @Test
     void aCleanResultEntersPromotingWithTheVersionScannedAndStaysInFlight() {
         ArgumentCaptor<UpdateItemRequest> update = ArgumentCaptor.forClass(UpdateItemRequest.class);
         when(dynamo.updateItem(update.capture())).thenReturn(UpdateItemResponse.builder().attributes(item(FileStatus.PROMOTING)).build());
@@ -110,16 +170,10 @@ class FileRepositoryTests {
         when(dynamo.updateItem(update.capture())).thenReturn(UpdateItemResponse.builder().attributes(item(FileStatus.INFECTED)).build());
 
         repository.recordScan(ID, ScanResult.THREATS_FOUND, AT, "EICAR", "etag-1");
-        repository.finishPromotion(ID, FileStatus.AVAILABLE, AT, null);
+        repository.finishPromotion(ID, FileStatus.AVAILABLE, AT, null, false);
 
         assertThat(update.getAllValues().get(0).updateExpression()).contains("REMOVE expiresAt, stage, stageSince");
         assertThat(update.getAllValues().get(1).updateExpression()).contains("REMOVE stage, stageSince");
-    }
-
-    @Test
-    void onlyFilesInFlightAreInTheIndex() {
-        org.assertj.core.api.Assertions.assertThatThrownBy(() -> repository.inStageSince(FileStatus.AVAILABLE, AT, 10))
-                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test

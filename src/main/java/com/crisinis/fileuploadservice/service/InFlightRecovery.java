@@ -10,6 +10,7 @@ import com.crisinis.fileuploadservice.model.FileRecord;
 import com.crisinis.fileuploadservice.model.FileStatus;
 import com.crisinis.fileuploadservice.model.ScanResult;
 import com.crisinis.fileuploadservice.persistence.FileRepository;
+import com.crisinis.fileuploadservice.persistence.FileRepository.Stage;
 import com.crisinis.fileuploadservice.storage.FileStorage;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -72,7 +73,7 @@ public class InFlightRecovery {
 
     /** Finishes promotions whose process died. */
     void resumePromotions(Instant now) {
-        for (String id : stuck(FileStatus.PROMOTING, now.minus(scan.resumePromotionAfter()))) {
+        for (String id : stuck(Stage.PROMOTING, now.minus(scan.resumePromotionAfter()))) {
             try {
                 Optional<FileRecord> file = files.find(id).filter(f -> f.status() == FileStatus.PROMOTING);
                 if (file.isPresent()) {
@@ -81,14 +82,14 @@ public class InFlightRecovery {
                     outcomes.resumePromotion(file.get());
                 }
             } catch (RuntimeException e) {
-                LogEvent.RECOVERY_FAILED.at(log).with("file_id", id).with("stage", FileStatus.PROMOTING).cause(e).log();
+                LogEvent.RECOVERY_FAILED.at(log).with("file_id", id).with("stage", Stage.PROMOTING).cause(e).log();
             }
         }
     }
 
     /** Applies results GuardDuty tagged on objects whose result event never arrived. */
     void recoverScanResults(Instant now) {
-        for (String id : stuck(FileStatus.SCANNING, now.minus(scan.overdueAfter()))) {
+        for (String id : stuck(Stage.SCANNING, now.minus(scan.overdueAfter()))) {
             try {
                 Optional<ScanResult> result = storage.scanStatusTag(id).flatMap(ScanResult::of);
                 if (result.isPresent()) {
@@ -97,13 +98,13 @@ public class InFlightRecovery {
                     outcomes.applyRecoveredResult(id, result.get(), now);
                 }
             } catch (RuntimeException e) {
-                LogEvent.RECOVERY_FAILED.at(log).with("file_id", id).with("stage", FileStatus.SCANNING).cause(e).log();
+                LogEvent.RECOVERY_FAILED.at(log).with("file_id", id).with("stage", Stage.SCANNING).cause(e).log();
             }
         }
     }
 
     /** Files in {@code stage} since before {@code cutoff}; none if DynamoDB can't say (the next run retries). */
-    private Iterable<String> stuck(FileStatus stage, Instant cutoff) {
+    private Iterable<String> stuck(Stage stage, Instant cutoff) {
         try {
             return files.inStageSince(stage, cutoff, BATCH);
         } catch (DependencyUnavailableException e) {
