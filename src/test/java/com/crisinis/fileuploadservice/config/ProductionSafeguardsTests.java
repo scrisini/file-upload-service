@@ -50,8 +50,10 @@ class ProductionSafeguardsTests {
         Map<String, String> local = new java.util.HashMap<>(SAFE);
         local.put("file-upload-service.aws.s3-endpoint", "http://localhost:9099");
         local.put("file-upload-service.scan.simulator.enabled", "true");
+        local.put("file-upload-service.extraction.simulator.enabled", "true");
 
-        assertThat(ProductionSafeguards.violations(binder(local))).hasSize(2)
+        assertThat(ProductionSafeguards.violations(binder(local))).hasSize(3)
+                .anySatisfy(v -> assertThat(v).startsWith("file-upload-service.extraction.simulator.enabled"))
                 .anySatisfy(v -> assertThat(v).startsWith("file-upload-service.aws.*-endpoint"))
                 .anySatisfy(v -> assertThat(v).startsWith("file-upload-service.scan.simulator.enabled"))
                 .noneSatisfy(v -> assertThat(v).contains("localhost"));

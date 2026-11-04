@@ -2,6 +2,7 @@ package com.crisinis.fileuploadservice.service;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
@@ -56,7 +57,7 @@ class ScanOutcomesTests {
     static FileRecord file(FileStatus status, ScanResult result, Instant availableAt) {
         return new FileRecord(ID, "a.png", FileType.PNG, 8, UploadMethod.PRESIGNED_URL, status, LANDED.minusSeconds(5),
                 LANDED, result == null ? null : SCANNED, availableAt, result, null,
-                result == null ? null : "etag-1");
+                result == null ? null : "etag-1", null);
     }
 
     static ScanEvent.ScanCompleted result(ScanResult result, String reason) {
@@ -78,16 +79,30 @@ class ScanOutcomesTests {
                 .thenReturn(Optional.of(new Update(true, file(FileStatus.PROMOTING, ScanResult.NO_THREATS_FOUND, null))));
         when(storage.readSignature(ID)).thenReturn(Optional.of(PNG));
         when(storage.promote(ID, FileType.PNG, "etag-1")).thenReturn(Promotion.COPIED);
-        when(files.finishPromotion(ID, FileStatus.AVAILABLE, NOW, null))
+        when(files.finishPromotion(ID, FileStatus.AVAILABLE, NOW, null, false))
                 .thenReturn(Optional.of(new Update(true, file(FileStatus.AVAILABLE, ScanResult.NO_THREATS_FOUND, NOW))));
 
         outcomes.handle(result(ScanResult.NO_THREATS_FOUND, null));
 
-        verify(files).finishPromotion(ID, FileStatus.AVAILABLE, NOW, null);
+        verify(files).finishPromotion(ID, FileStatus.AVAILABLE, NOW, null, false);
         assertThat(registry.get("file-upload-service.scan.duration").tag("result", "NO_THREATS_FOUND").timer()
                 .totalTime(java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(20);
         assertThat(registry.get("file-upload-service.files.time-to-available").tag("method", "presigned_url").timer()
                 .totalTime(java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(21);
+    }
+
+    @Test
+    void anOptedInFileIsHandedToExtractionWhenItBecomesAvailable() {
+        FileRecord optedIn = new FileRecord(ID, "a.png", FileType.PNG, 8, UploadMethod.PRESIGNED_URL, FileStatus.PROMOTING,
+                LANDED.minusSeconds(5), LANDED, SCANNED, null, ScanResult.NO_THREATS_FOUND, null, "etag-1",
+                com.crisinis.fileuploadservice.model.ExtractionKind.INSURANCE_POLICY);
+        when(storage.readSignature(ID)).thenReturn(Optional.of(PNG));
+        when(storage.promote(ID, FileType.PNG, "etag-1")).thenReturn(Promotion.COPIED);
+        when(files.finishPromotion(any(), any(), any(), any(), anyBoolean())).thenReturn(Optional.empty());
+
+        outcomes.resumePromotion(optedIn);
+
+        verify(files).finishPromotion(ID, FileStatus.AVAILABLE, NOW, null, true);
     }
 
     @Test
@@ -106,11 +121,11 @@ class ScanOutcomesTests {
         when(files.recordScan(any(), any(), any(), any(), any()))
                 .thenReturn(Optional.of(new Update(true, file(FileStatus.PROMOTING, ScanResult.NO_THREATS_FOUND, null))));
         when(storage.readSignature(ID)).thenReturn(Optional.of("%PDF-1.7".getBytes()));
-        when(files.finishPromotion(eq(ID), eq(FileStatus.REJECTED), any(), any())).thenReturn(Optional.empty());
+        when(files.finishPromotion(eq(ID), eq(FileStatus.REJECTED), any(), any(), eq(false))).thenReturn(Optional.empty());
 
         outcomes.handle(result(ScanResult.NO_THREATS_FOUND, null));
 
-        verify(files).finishPromotion(ID, FileStatus.REJECTED, NOW, "CONTENT_MISMATCH: declared PNG, content is PDF");
+        verify(files).finishPromotion(ID, FileStatus.REJECTED, NOW, "CONTENT_MISMATCH: declared PNG, content is PDF", false);
         verify(storage, never()).promote(any(), any(), any());
     }
 
@@ -121,11 +136,11 @@ class ScanOutcomesTests {
                 .thenReturn(Optional.of(new Update(false, file(FileStatus.PROMOTING, ScanResult.NO_THREATS_FOUND, null))));
         when(storage.readSignature(ID)).thenReturn(Optional.empty());
         when(storage.isPromoted(ID)).thenReturn(true);
-        when(files.finishPromotion(any(), any(), any(), any())).thenReturn(Optional.empty());
+        when(files.finishPromotion(any(), any(), any(), any(), anyBoolean())).thenReturn(Optional.empty());
 
         outcomes.handle(result(ScanResult.NO_THREATS_FOUND, null));
 
-        verify(files).finishPromotion(ID, FileStatus.AVAILABLE, NOW, null);
+        verify(files).finishPromotion(ID, FileStatus.AVAILABLE, NOW, null, false);
         assertThat(registry.get("file-upload-service.scan.duration").tag("result", "NO_THREATS_FOUND").timer().count())
                 .as("measured once, by the delivery that recorded it").isZero();
     }
@@ -138,7 +153,7 @@ class ScanOutcomesTests {
         outcomes.handle(result(ScanResult.NO_THREATS_FOUND, null));
 
         verify(storage, never()).readSignature(any());
-        verify(files, never()).finishPromotion(any(), any(), any(), any());
+        verify(files, never()).finishPromotion(any(), any(), any(), any(), anyBoolean());
     }
 
     @Test
@@ -147,11 +162,11 @@ class ScanOutcomesTests {
                 .thenReturn(Optional.of(new Update(true, file(FileStatus.PROMOTING, ScanResult.NO_THREATS_FOUND, null))));
         when(storage.readSignature(ID)).thenReturn(Optional.of(PNG));
         when(storage.promote(ID, FileType.PNG, "etag-1")).thenReturn(Promotion.SOURCE_CHANGED);
-        when(files.finishPromotion(any(), any(), any(), any())).thenReturn(Optional.empty());
+        when(files.finishPromotion(any(), any(), any(), any(), anyBoolean())).thenReturn(Optional.empty());
 
         outcomes.handle(result(ScanResult.NO_THREATS_FOUND, null));
 
-        verify(files).finishPromotion(ID, FileStatus.REJECTED, NOW, "CHANGED_AFTER_SCAN");
+        verify(files).finishPromotion(ID, FileStatus.REJECTED, NOW, "CHANGED_AFTER_SCAN", false);
     }
 
     @Test
@@ -169,12 +184,12 @@ class ScanOutcomesTests {
     void aPromotionCanBeFinishedFromTheRecordAloneWithTheVersionScanned() {
         when(storage.readSignature(ID)).thenReturn(Optional.of(PNG));
         when(storage.promote(ID, FileType.PNG, "etag-1")).thenReturn(Promotion.COPIED);
-        when(files.finishPromotion(any(), any(), any(), any())).thenReturn(Optional.empty());
+        when(files.finishPromotion(any(), any(), any(), any(), anyBoolean())).thenReturn(Optional.empty());
 
         outcomes.resumePromotion(file(FileStatus.PROMOTING, ScanResult.NO_THREATS_FOUND, null));
 
         verify(storage).promote(ID, FileType.PNG, "etag-1");
-        verify(files).finishPromotion(ID, FileStatus.AVAILABLE, NOW, null);
+        verify(files).finishPromotion(ID, FileStatus.AVAILABLE, NOW, null, false);
     }
 
     @Test
@@ -189,16 +204,16 @@ class ScanOutcomesTests {
         when(files.recordScan(ID, ScanResult.NO_THREATS_FOUND, NOW, ScanOutcomes.RECOVERED_FROM_TAG, null))
                 .thenReturn(Optional.of(new Update(true, new FileRecord(ID, "a.png", FileType.PNG, 8, UploadMethod.STREAM,
                         FileStatus.PROMOTING, LANDED, LANDED, NOW, null, ScanResult.NO_THREATS_FOUND,
-                        ScanOutcomes.RECOVERED_FROM_TAG, null))));
+                        ScanOutcomes.RECOVERED_FROM_TAG, null, null))));
         when(storage.readSignature(ID)).thenReturn(Optional.of(PNG));
         when(storage.promote(ID, FileType.PNG, null)).thenReturn(Promotion.COPIED);
-        when(files.finishPromotion(any(), any(), any(), any())).thenReturn(Optional.empty());
+        when(files.finishPromotion(any(), any(), any(), any(), anyBoolean())).thenReturn(Optional.empty());
 
         outcomes.applyRecoveredResult(ID, ScanResult.NO_THREATS_FOUND, NOW);
 
         // quarantine objects can't be replaced, so without the scanned ETag the copy is unconditional
         verify(storage).promote(ID, FileType.PNG, null);
-        verify(files).finishPromotion(ID, FileStatus.AVAILABLE, NOW, null);
+        verify(files).finishPromotion(ID, FileStatus.AVAILABLE, NOW, null, false);
     }
 
     @Test

@@ -14,6 +14,7 @@ import java.util.UUID;
 import java.util.concurrent.Semaphore;
 
 import com.crisinis.fileuploadservice.config.FileUploadServiceProperties;
+import com.crisinis.fileuploadservice.extraction.BedrockPolicyModel;
 import com.crisinis.fileuploadservice.logging.LogEvent;
 import com.crisinis.fileuploadservice.model.FileRecord;
 import com.crisinis.fileuploadservice.model.FileStatus;
@@ -57,6 +58,7 @@ public class UploadService {
     private final Map<UploadMethod, Counter> accepted = new EnumMap<>(UploadMethod.class);
     private final Map<UploadMethod, Counter> rejected = new EnumMap<>(UploadMethod.class);
     private final Counter streamedBytes;
+    private final boolean extractionEnabled;
 
     public UploadService(FileRepository files, FileStorage storage, FileUploadServiceProperties properties,
                          Clock clock, MeterRegistry registry) {
@@ -65,6 +67,7 @@ public class UploadService {
         this.uploads = properties.uploads();
         this.clock = clock;
         this.streams = new Semaphore(uploads.maxConcurrentStreams());
+        this.extractionEnabled = properties.extraction().enabled();
         for (UploadMethod method : UploadMethod.values()) {
             accepted.put(method, uploadCounter(registry, method, "accepted"));
             rejected.put(method, uploadCounter(registry, method, "rejected"));
@@ -82,10 +85,11 @@ public class UploadService {
      * idempotency key a retry gets the same file: a fresh URL while its bytes haven't landed, and
      * no URL once they have.
      */
-    public UploadResult requestUpload(String fileName, String mediaType, long size, Optional<IdempotencyKey> key) {
-        FileType type = accept(UploadMethod.PRESIGNED_URL, mediaType, size);
-        FileRecord requested = FileRecord.awaitingUpload(idFor(key), cleanName(fileName), type, size,
-                UploadMethod.PRESIGNED_URL, clock.instant());
+    public UploadResult requestUpload(DeclaredFile declared, Optional<IdempotencyKey> key) {
+        FileType type = accept(UploadMethod.PRESIGNED_URL, declared);
+        long size = declared.size();
+        FileRecord requested = FileRecord.awaitingUpload(idFor(key), cleanName(declared.fileName()), type, size,
+                UploadMethod.PRESIGNED_URL, clock.instant(), declared.extraction());
         FileRepository.Update created = files.createIfAbsent(requested);
         FileRecord file = sameRequest(created, requested);
         if (file.status() != FileStatus.AWAITING_UPLOAD) {
@@ -97,7 +101,7 @@ public class UploadService {
         }
         accepted.get(UploadMethod.PRESIGNED_URL).increment();
         LogEvent.UPLOAD_URL_ISSUED.at(log).with("file_id", file.id()).with("file_type", type)
-                .with("size", size).with("expires_at", upload.expiresAt()).log();
+                .with("size", size).with("extraction", file.extraction()).with("expires_at", upload.expiresAt()).log();
         return new UploadResult(file, upload, false);
     }
 
@@ -106,16 +110,15 @@ public class UploadService {
      * the body to quarantine. Nothing is stored if a check fails. With an idempotency key a retry of
      * a file that already landed is answered with that file, without reading the body again.
      *
-     * @param contentLength the request's Content-Length; -1 when it has none (chunked)
+     * @param declared the file; its size is the request's Content-Length, -1 when it has none (chunked)
      */
-    public UploadResult stream(String fileName, String mediaType, long contentLength, InputStream body,
-                               Optional<IdempotencyKey> key) {
-        if (contentLength < 0) {
+    public UploadResult stream(DeclaredFile declared, InputStream body, Optional<IdempotencyKey> key) {
+        if (declared.size() < 0) {
             throw reject(UploadMethod.STREAM, Reason.LENGTH_REQUIRED, "send the file with a Content-Length header");
         }
-        FileType type = accept(UploadMethod.STREAM, mediaType, contentLength);
-        FileRecord requested = FileRecord.awaitingUpload(idFor(key), cleanName(fileName), type, contentLength,
-                UploadMethod.STREAM, clock.instant());
+        FileType type = accept(UploadMethod.STREAM, declared);
+        FileRecord requested = FileRecord.awaitingUpload(idFor(key), cleanName(declared.fileName()), type,
+                declared.size(), UploadMethod.STREAM, clock.instant(), declared.extraction());
         Optional<FileRecord> landed = key.flatMap(k -> files.find(requested.id()))
                 .filter(existing -> existing.status() != FileStatus.AWAITING_UPLOAD);
         if (landed.isPresent()) {
@@ -180,7 +183,8 @@ public class UploadService {
             throw e;
         }
         accepted.get(UploadMethod.STREAM).increment();
-        LogEvent.UPLOAD_STREAMED.at(log).with("file_id", file.id()).with("file_type", type).with("size", size).log();
+        LogEvent.UPLOAD_STREAMED.at(log).with("file_id", file.id()).with("file_type", type).with("size", size)
+                .with("extraction", file.extraction()).log();
         return new UploadResult(submitted(file), null, false);
     }
 
@@ -214,10 +218,13 @@ public class UploadService {
     private FileRecord sameRequest(FileRepository.Update created, FileRecord requested) {
         FileRecord file = created.file();
         if (!created.changed() && !(file.fileName().equals(requested.fileName()) && file.type() == requested.type()
-                && file.size() == requested.size() && file.method() == requested.method())) {
+                && file.size() == requested.size() && file.method() == requested.method()
+                && file.extraction() == requested.extraction())) {
             throw reject(requested.method(), Reason.IDEMPOTENCY_KEY_REUSED,
                     "this Idempotency-Key was used for another file (" + file.fileName() + ", " + file.type().mediaType()
-                            + ", " + file.size() + " bytes, " + file.method() + "); use a new key for a new file");
+                            + ", " + file.size() + " bytes, " + file.method()
+                            + (file.extraction() == null ? "" : ", extract " + file.extraction())
+                            + "); use a new key for a new file");
         }
         return file;
     }
@@ -238,8 +245,10 @@ public class UploadService {
         }
     }
 
-    /** The type for this declared media type and size, or a rejection. */
-    private FileType accept(UploadMethod method, String mediaType, long size) {
+    /** The type for this declared file, or a rejection: its type, its size, and whether it can be extracted. */
+    private FileType accept(UploadMethod method, DeclaredFile declared) {
+        String mediaType = declared.mediaType();
+        long size = declared.size();
         FileType type = FileType.fromMediaType(mediaType)
                 .filter(uploads.allowedTypes()::contains)
                 .orElseThrow(() -> reject(method, Reason.UNSUPPORTED_TYPE,
@@ -251,7 +260,21 @@ public class UploadService {
             throw reject(method, Reason.TOO_LARGE,
                     "the file is " + size + " bytes; the limit is " + uploads.maxSize().toBytes());
         }
+        if (declared.extraction() != null) {
+            acceptExtraction(method, type, size);
+        }
         return type;
+    }
+
+    /** Opting in is refused now, rather than failing later, when extraction can't happen for this file. */
+    private void acceptExtraction(UploadMethod method, FileType type, long size) {
+        if (!extractionEnabled) {
+            throw reject(method, Reason.EXTRACTION_NOT_SUPPORTED, "extraction isn't available: no model is configured");
+        }
+        var refusal = BedrockPolicyModel.refusal(type, size);
+        if (refusal.isPresent()) {
+            throw reject(method, Reason.EXTRACTION_NOT_SUPPORTED, refusal.get());
+        }
     }
 
     private UploadRejectedException reject(UploadMethod method, Reason reason, String message) {

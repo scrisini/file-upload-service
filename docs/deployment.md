@@ -63,6 +63,8 @@ flowchart LR
 | SQS or EventBridge is down, or the rules are wrong | Uploads are accepted; files stay `SCANNING` and `scan.in-progress` grows; overdue scans are reported ([2009](runbook.md#file_upload_service-2009)) | None while events are kept: SQS keeps them 4 days. A wrong rule loses events: fix it, then re-run the scans (below) |
 | GuardDuty is slow or its plan is unhealthy | Files stay `SCANNING` longer; nothing unscanned is ever served | None |
 | All instances restart, or are killed (`kill -9`, OOM) | Streamed uploads in flight fail and are retried by callers; presigned PUTs are unaffected | None: every state is in DynamoDB, S3 and SQS, and interrupted work is finished by redelivery or the recovery job (README "Crash safety") |
+| Bedrock is down, throttled or the model is unavailable | Nothing: uploads and scans carry on; extractions wait and retry, then FAILED after `max-attempts` ([3008](runbook.md#file_upload_service-3008), [2015](runbook.md#file_upload_service-2015)) | None; failed extractions can be re-run once fixed |
+| An instance dies during a model call | Nothing | None: the lease ends and another instance extracts the file |
 | Instances crash repeatedly on some events | Their events reach the dead-letter queue | None: the recovery job finishes interrupted promotions and applies results from GuardDuty's object tags; redriving the dead-letter queue is safe |
 
 **Re-running scans** for files stuck `SCANNING` after lost events: GuardDuty scans an object again
@@ -97,11 +99,16 @@ flowchart LR
 | **SQS queue** `file-upload-scan-events` | Standard queue; visibility timeout 60 s (above the longest promotion: a copy of `max-size`); retention 4 days; redrive to `file-upload-scan-events-dlq` after 5 receives; a policy letting the two rules send | `scan-queue-policy.json` |
 | **DynamoDB table** `file-upload-service-files` | On-demand; the sparse `in-flight` index; **TTL on `expiresAt`** (removes records of uploads never made); point-in-time recovery | `dynamodb-table.json` (`aws dynamodb create-table --cli-input-json file://deploy/aws/dynamodb-table.json`, then `update-time-to-live --time-to-live-specification Enabled=true,AttributeName=expiresAt`) |
 | **The service's IAM role** (EKS Pod Identity or IRSA, `serviceaccount.yaml`) | S3 on the two prefixes, the table and its index, receive and delete on the queue; plus SSM as before, and `kms:Decrypt`/`kms:GenerateDataKey` on keys used by the buckets, table or queue | `service-policy.json` |
-| **VPC endpoints** | Gateway endpoints for S3 and DynamoDB; interface endpoint for SQS (and SSM). The service reaches AWS through these, not the outbound proxy | |
+| **Bedrock model** | The trained model, as a model ARN the service can call with Converse (custom/fine-tuned with provisioned throughput, an imported model, or an inference profile), in the service's region. Set its id in Parameter Store: `file-upload-service/extraction/model-id`. Check its quota (tokens and requests per minute) against `extraction.concurrency` × instances | |
+| **VPC endpoints** | Gateway endpoints for S3 and DynamoDB; interface endpoints for SQS, **Bedrock Runtime** (`bedrock-runtime`) and SSM. The service reaches AWS through these, not the outbound proxy | |
 
 **Parameters** in Parameter Store under the service's path (README "Configuration"):
 `file-upload-service/scan/queue-url`, and `file-upload-service/storage/quarantine-bucket`,
 `clean-bucket` and `table` when the names differ from the defaults.
+
+**`/internal/` stays internal:** the ingress routes only `/api/`; internal systems call the service
+inside the cluster (its Service, port 80). Add a NetworkPolicy allowing only those callers on
+`/internal/` if other workloads share the cluster: extraction results are personal data.
 
 **Presigned uploads come from browsers**: the URL points at S3's public endpoint, so front-ends
 need network access to S3 and the bucket's CORS rules must list their origins. The bucket policy

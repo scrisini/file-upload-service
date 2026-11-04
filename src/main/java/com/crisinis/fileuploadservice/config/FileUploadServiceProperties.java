@@ -26,6 +26,7 @@ import org.springframework.util.unit.DataSize;
  * @param storage       the quarantine and clean buckets, and the table of file records
  * @param uploads       what callers may upload, and how
  * @param scan          GuardDuty's results: the queue they arrive on, and when a scan is overdue
+ * @param extraction    reading insurance policies from opted-in uploads with a model on Amazon Bedrock
  */
 @ConfigurationProperties("file-upload-service")
 public record FileUploadServiceProperties(
@@ -34,7 +35,8 @@ public record FileUploadServiceProperties(
         @DefaultValue Aws aws,
         @DefaultValue Storage storage,
         @DefaultValue Uploads uploads,
-        @DefaultValue Scan scan) {
+        @DefaultValue Scan scan,
+        @DefaultValue Extraction extraction) {
 
     private static final Pattern BUCKET = Pattern.compile("[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]");
     private static final Pattern PREFIX = Pattern.compile("([A-Za-z0-9!_.*'()-]+/)*");
@@ -101,7 +103,8 @@ public record FileUploadServiceProperties(
      *                         for itself, {@code http://localhost:9099} for browsers)
      * @param sqsEndpoint      override for SQS; blank for AWS
      * @param dynamodbEndpoint override for DynamoDB; blank for AWS
-     * @param timeout          limit for each call except a streamed upload's PUT
+     * @param bedrockEndpoint  override for Bedrock Runtime (e.g. a VPC endpoint URL); blank for AWS
+     * @param timeout          limit for each call except a streamed upload's PUT and a model call
      */
     public record Aws(
             @DefaultValue("") String region,
@@ -109,6 +112,7 @@ public record FileUploadServiceProperties(
             @DefaultValue("") String s3PresignEndpoint,
             @DefaultValue("") String sqsEndpoint,
             @DefaultValue("") String dynamodbEndpoint,
+            @DefaultValue("") String bedrockEndpoint,
             @DefaultValue("10s") Duration timeout) {
 
         public Aws {
@@ -117,10 +121,14 @@ public record FileUploadServiceProperties(
             s3PresignEndpoint = endpoint("s3-presign-endpoint", s3PresignEndpoint);
             sqsEndpoint = endpoint("sqs-endpoint", sqsEndpoint);
             dynamodbEndpoint = endpoint("dynamodb-endpoint", dynamodbEndpoint);
+            bedrockEndpoint = endpoint("bedrock-endpoint", bedrockEndpoint);
             positive("aws.timeout", timeout);
         }
 
-        /** Whether any service is pointed away from AWS (an emulator): never in production. */
+        /**
+         * Whether S3, SQS or DynamoDB is pointed away from AWS (an emulator): never in production. A
+         * Bedrock endpoint may be a VPC endpoint, so it doesn't count.
+         */
         public boolean overridden() {
             return !s3Endpoint.isEmpty() || !s3PresignEndpoint.isEmpty() || !sqsEndpoint.isEmpty()
                     || !dynamodbEndpoint.isEmpty();
@@ -292,6 +300,81 @@ public record FileUploadServiceProperties(
         public Simulator {
             if (delay == null || delay.isNegative()) {
                 throw new IllegalArgumentException("file-upload-service.scan.simulator.delay must not be negative, was " + delay);
+            }
+        }
+    }
+
+    /**
+     * Policy extraction: an opted-in upload, once AVAILABLE, is sent to the model on Amazon Bedrock
+     * (Converse API) by a worker, and the answer is read into the policy schema. README "Policy
+     * extraction".
+     *
+     * @param modelId      the model's id or ARN (foundation, custom, imported, provisioned or an
+     *                     inference profile); blank turns extraction off, and uploads that opt in are refused
+     * @param maxTokens    limit on the model's answer
+     * @param timeout      limit for one model call
+     * @param maxAttempts  model calls per file before it's FAILED; temporary failures (throttling, timeouts) retry
+     * @param retryBackoff wait before a retry, times the attempt number
+     * @param lease        how long a worker holds a claimed extraction; if it dies, another takes over after
+     *                     this. Longer than {@code timeout}
+     * @param pollInterval how often idle workers look for pending extractions
+     * @param concurrency  model calls one instance makes at once (bounds memory: one image each, at most 4.5 MB)
+     * @param simulator    a stand-in for Bedrock on a laptop; refused in production
+     */
+    public record Extraction(
+            @DefaultValue("") String modelId,
+            @DefaultValue("2000") int maxTokens,
+            @DefaultValue("60s") Duration timeout,
+            @DefaultValue("3") int maxAttempts,
+            @DefaultValue("30s") Duration retryBackoff,
+            @DefaultValue("3m") Duration lease,
+            @DefaultValue("2s") Duration pollInterval,
+            @DefaultValue("4") int concurrency,
+            @DefaultValue BedrockSimulator simulator) {
+
+        public Extraction {
+            modelId = trim(modelId);
+            if (maxTokens < 100 || maxTokens > 100_000) {
+                throw new IllegalArgumentException("file-upload-service.extraction.max-tokens must be between 100 and 100000, was " + maxTokens);
+            }
+            positive("extraction.timeout", timeout);
+            positive("extraction.retry-backoff", retryBackoff);
+            positive("extraction.poll-interval", pollInterval);
+            positive("extraction.lease", lease);
+            if (lease.compareTo(timeout.plusSeconds(10)) < 0) {
+                throw new IllegalArgumentException("file-upload-service.extraction.lease must be at least 10s longer than "
+                        + "extraction.timeout, or a slow call would be taken over while still running; was " + lease);
+            }
+            if (maxAttempts < 1 || maxAttempts > 10) {
+                throw new IllegalArgumentException("file-upload-service.extraction.max-attempts must be between 1 and 10, was " + maxAttempts);
+            }
+            if (concurrency < 1 || concurrency > 64) {
+                throw new IllegalArgumentException("file-upload-service.extraction.concurrency must be between 1 and 64, was " + concurrency);
+            }
+        }
+
+        /** Whether extraction runs: a model is configured. */
+        public boolean enabled() {
+            return !modelId.isEmpty();
+        }
+    }
+
+    /**
+     * Local development only: answers Converse calls with an invented policy instead of Bedrock, so
+     * extraction runs without AWS. Production mode refuses it. Content markers make it fail for
+     * tests: {@code BEDROCK-THROTTLE} (temporary failures), {@code BEDROCK-GARBAGE} (an answer that
+     * isn't JSON), {@code BEDROCK-REFUSE} (a permanent error).
+     *
+     * @param enabled whether to use it instead of Bedrock
+     * @param delay   how long a simulated call takes
+     */
+    public record BedrockSimulator(
+            @DefaultValue("false") boolean enabled,
+            @DefaultValue("1s") Duration delay) {
+
+        public BedrockSimulator {
+            if (delay == null || delay.isNegative()) {
+                throw new IllegalArgumentException("file-upload-service.extraction.simulator.delay must not be negative, was " + delay);
             }
         }
     }

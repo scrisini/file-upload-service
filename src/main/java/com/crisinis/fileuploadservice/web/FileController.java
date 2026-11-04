@@ -6,7 +6,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
+import com.crisinis.fileuploadservice.model.ExtractionKind;
 import com.crisinis.fileuploadservice.model.IdempotencyKey;
+import com.crisinis.fileuploadservice.service.DeclaredFile;
 import com.crisinis.fileuploadservice.model.ScanSummary;
 import com.crisinis.fileuploadservice.service.ScanMonitor;
 import com.crisinis.fileuploadservice.service.UnknownFileException;
@@ -44,8 +46,9 @@ public class FileController {
      *
      * @param contentType the file's media type, e.g. {@code image/png}
      * @param size        the file's exact length in bytes
+     * @param extract     optional: {@code INSURANCE_POLICY} to have the file read once it's available
      */
-    public record UploadRequest(String fileName, String contentType, Long size) {
+    public record UploadRequest(String fileName, String contentType, Long size, String extract) {
     }
 
     /**
@@ -66,6 +69,9 @@ public class FileController {
     private static final String KEY_DESCRIPTION = "Optional. A unique value per file (a UUID). Send the same key "
             + "when retrying an upload whose answer was lost: the retry gets the same file instead of a new one. "
             + "A key used for another file is refused (422).";
+    private static final String EXTRACT_DESCRIPTION = "Optional. INSURANCE_POLICY to have the policy in the file read by "
+            + "the extraction model once the file is available (PNG, JPEG, GIF, WebP up to 3.75 MB; PDF up to 4.5 MB). "
+            + "The result is for internal systems only. Refused (422) when the file can't be extracted.";
 
     private final UploadService uploads;
     private final ScanMonitor scans;
@@ -96,8 +102,8 @@ public class FileController {
         if (request.size() == null) {
             throw new IllegalArgumentException("size is required: the file's length in bytes");
         }
-        UploadResult result = uploads.requestUpload(request.fileName(), request.contentType(), request.size(),
-                key(idempotencyKey));
+        UploadResult result = uploads.requestUpload(new DeclaredFile(request.fileName(), request.contentType(),
+                request.size(), extraction(request.extract())), key(idempotencyKey));
         var upload = result.upload();
         return ResponseEntity.created(URI.create(filePath(result.file().id())))
                 .header(REPLAYED, Boolean.toString(result.replayed()))
@@ -139,15 +145,25 @@ public class FileController {
     ResponseEntity<FileView> stream(
             @Parameter(description = "The file's name, kept for downloads; any path is dropped")
             @RequestParam(required = false) String fileName,
+            @Parameter(description = EXTRACT_DESCRIPTION)
+            @RequestParam(required = false) String extract,
             @Parameter(in = ParameterIn.HEADER, description = KEY_DESCRIPTION)
             @RequestHeader(name = IdempotencyKey.HEADER, required = false) String idempotencyKey,
             @Parameter(hidden = true) HttpServletRequest request)
             throws IOException {
-        UploadResult result = uploads.stream(fileName, request.getContentType(), request.getContentLengthLong(),
-                request.getInputStream(), key(idempotencyKey));
+        UploadResult result = uploads.stream(new DeclaredFile(fileName, request.getContentType(),
+                request.getContentLengthLong(), extraction(extract)), request.getInputStream(), key(idempotencyKey));
         return ResponseEntity.status(HttpStatus.ACCEPTED).location(URI.create(filePath(result.file().id())))
                 .header(REPLAYED, Boolean.toString(result.replayed()))
                 .body(FileView.of(result.file()));
+    }
+
+    private static ExtractionKind extraction(String requested) {
+        if (requested == null || requested.isBlank()) {
+            return null;
+        }
+        return ExtractionKind.of(requested).orElseThrow(() -> new IllegalArgumentException(
+                "extract must be one of " + java.util.Arrays.toString(ExtractionKind.values()) + ", was '" + requested + "'"));
     }
 
     private static Optional<IdempotencyKey> key(String header) {

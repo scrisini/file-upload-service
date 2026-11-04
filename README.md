@@ -22,6 +22,8 @@ explains it. Keep it current: add a row in the same pull request as the feature.
 | Promotion | Clean files are copied inside S3 to the clean bucket (only the version scanned) and removed from quarantine; infected and unscanned files are never served | [File lifecycle](#file-lifecycle) |
 | Crash safety | A kill or crash at any point leaves a state another instance finishes: events are redelivered, and a recovery job resumes interrupted promotions and applies results from GuardDuty's object tags | [Crash safety](#crash-safety) |
 | Idempotent retries | An `Idempotency-Key` header makes a retried upload return the file its first attempt created, so a lost answer never produces a second copy; concurrent duplicates store one file | [Idempotent retries](#idempotent-retries) |
+| Policy extraction | Uploads that opt in (`extract=INSURANCE_POLICY`) are read by a model on Amazon Bedrock once they're available; the policy (insurer, number, holder, dates, premium, cover…) with a confidence per field is stored for internal systems only | [Policy extraction](#policy-extraction) |
+| Integration tests against real AWS | `./gradlew integrationTest`: Bedrock, S3 signatures, DynamoDB and GuardDuty for real; never part of the normal build | [Testing against real AWS](#testing-against-real-aws) |
 | Test scenarios | Every behaviour as a test scenario with steps and expected results, for testers | [`docs/test-scenarios.md`](docs/test-scenarios.md) |
 | Scan tracking | Each file's status with when it landed (GuardDuty picked it up), when the scan finished and the result; scans in progress across all instances (`GET /api/v1/scans`, gauge `scan.in-progress`); overdue scans reported once | [REST API](#rest-api), [Metrics](#metrics) |
 | Download | `GET /api/v1/files/{id}/content` redirects to a 5-minute S3 link for an available file | [REST API](#rest-api) |
@@ -143,6 +145,7 @@ a few minutes; later ones take under a minute.
 | POST | `/api/v1/files?fileName=…` | **Stream style.** The body is the file (not multipart), `Content-Type` its media type, `Content-Length` its size. 202 with `Location` and the file (`SCANNING`) |
 | GET | `/api/v1/files/{id}` | The file: `status`, `createdAt`, `submittedForScanAt` (landed; GuardDuty picked it up), `scanCompletedAt`, `scanResult`, `availableAt`, `rejectedBecause`, `contentUrl` |
 | GET | `/api/v1/files/{id}/content` | 303 to a 5-minute download link; 409 unless `AVAILABLE` |
+| GET | `/internal/v1/files/{id}/extraction` | **Internal only** (not routed by the public load balancer): the file's [policy extraction](#policy-extraction) |
 | GET | `/api/v1/scans` | `{inProgress, oldestSubmittedAt, overdueAfter}`: files GuardDuty is scanning now, across all instances |
 | GET | `/v3/api-docs`, `/swagger-ui.html` | The OpenAPI description and Swagger UI ([API documentation](#api-documentation)); not in production |
 | GET | `/actuator/health` | Health, including `s3`, `dynamoDb` and `scanQueue` (not part of readiness) |
@@ -156,8 +159,68 @@ a few minutes; later ones take under a minute.
 | 411 | Streamed without `Content-Length` |
 | 413 | Larger than `uploads.max-size` (`TOO_LARGE`) |
 | 415 | Type not accepted (`UNSUPPORTED_TYPE`), or the content isn't the declared type (`CONTENT_MISMATCH`) |
-| 422 | The `Idempotency-Key` was used for another file (`IDEMPOTENCY_KEY_REUSED`) |
+| 422 | The `Idempotency-Key` was used for another file (`IDEMPOTENCY_KEY_REUSED`), or `extract` was asked for a file that can't be extracted (`EXTRACTION_NOT_SUPPORTED`) |
 | 503 | S3 or DynamoDB unavailable (`Retry-After: 5`), or this instance is streaming its maximum (`Retry-After: 1`) |
+
+### Policy extraction
+
+An uploader can ask for the file to be read as an insurance policy: `"extract": "INSURANCE_POLICY"`
+in the presigned request, or `?extract=INSURANCE_POLICY` on a stream. Front-ends only opt in; the
+result is **for internal systems only**.
+
+- **When:** once the file is `AVAILABLE` (scanned clean, content checked, in the clean bucket). An
+  infected, rejected or unscanned file is never sent to the model.
+- **What can opt in:** PNG, JPEG, GIF and WebP up to 3.75 MB, PDF up to 4.5 MB: Bedrock's limits.
+  Anything else (HEIC, TIFF, larger files), or opting in with no model configured, is refused at
+  upload with **422** `EXTRACTION_NOT_SUPPORTED`, so an extraction never fails for a reason known up
+  front.
+- **How:** worker threads on every instance (`extraction.concurrency`, 4) claim pending extractions
+  with a DynamoDB lease, read the file from the clean bucket, and call the model with Bedrock's
+  **Converse API** (`extraction.model-id`: a foundation, custom, imported or provisioned model, or an
+  inference profile). The prompt is `src/main/resources/extraction/insurance-policy-prompt.txt`.
+- **Result:** the answer is validated into the policy schema: every field has a `value` and a
+  `confidence` (0–1); a value that isn't valid (a date that isn't a date, an unknown currency) is
+  dropped with a `warning` naming the field, never the value. Money is a whole number of minor units
+  (`amountMinor`, `currency`, `scale`), never a decimal.
+- **Failures:** throttling, timeouts and garbled answers retry after `retry-backoff` × attempt, up
+  to `max-attempts` (3); access denied, an unknown model or a refused document fail at once. The
+  file itself is unaffected.
+- **Crash safety:** the hand-off to extraction is part of the write that makes the file available,
+  and a worker that dies mid-call leaves its lease to expire: another worker takes the file over.
+- **Personal data:** policy values are never logged; logs and metrics carry counts and token use.
+
+`GET /internal/v1/files/{id}/extraction` (internal only; 404 if the file wasn't opted in):
+
+```json
+{
+  "fileId": "0b8e…", "kind": "INSURANCE_POLICY", "status": "COMPLETED",
+  "requestedAt": "2026-11-04T10:00:00Z", "completedAt": "2026-11-04T10:00:07Z",
+  "attempts": 1, "modelId": "arn:aws:bedrock:…", "failure": null,
+  "policy": {
+    "insurer": {"value": "Example Insurance Ltd", "confidence": 0.98},
+    "policyNumber": {"value": "HPC-0042-7781", "confidence": 0.97},
+    "policyType": {"value": "HOME_AND_CONTENTS", "confidence": 0.9},
+    "holder": {"name": {…}, "dateOfBirth": {"value": "1984-07-21", …}, "address": {…}},
+    "insuredPersons": [{"name": {…}, "dateOfBirth": {…}}],
+    "startDate": {…}, "endDate": {"value": "2027-06-30", "confidence": 0.95},
+    "premium": {"value": {"amountMinor": 184260, "currency": "AUD", "scale": 2}, "confidence": 0.94},
+    "premiumFrequency": {…}, "sumInsured": {…}, "excess": {…}, "currency": {"value": "AUD", …},
+    "warnings": []
+  }
+}
+```
+
+| `status` | Meaning |
+|---|---|
+| `AWAITING_FILE` | The file is still being uploaded, scanned or promoted |
+| `PENDING` | Available; waiting for, or being read by, a worker |
+| `COMPLETED` | `policy` holds the result |
+| `FAILED` | `failure` says why ([2015](docs/runbook.md#file_upload_service-2015)) |
+| `NOT_EXTRACTED` | The file ended `INFECTED`, `REJECTED` or `NOT_SCANNED` |
+
+Locally, `scripts/dev.sh run` uses a **Bedrock simulator** that invents a policy (markers in the
+file make it fail: `BEDROCK-THROTTLE`, `BEDROCK-GARBAGE`, `BEDROCK-REFUSE`); production refuses it.
+`EXTRACT=INSURANCE_POLICY scripts/try-upload.sh presigned policy.png` follows a file through it.
 
 ### Idempotent retries
 
@@ -227,6 +290,13 @@ so a caller can quote it to support.
 | `file-upload-service.scan.monitor-interval` | `FILE_UPLOAD_SERVICE_SCAN_MONITOR_INTERVAL` | `15s` between counts of scans in progress |
 | `file-upload-service.scan.recovery-interval` | `FILE_UPLOAD_SERVICE_SCAN_RECOVERY_INTERVAL` | `1m` between runs of [crash recovery](#crash-safety) |
 | `file-upload-service.scan.resume-promotion-after` | `FILE_UPLOAD_SERVICE_SCAN_RESUME_PROMOTION_AFTER` | `2m`: a file `PROMOTING` this long is finished by recovery |
+| `file-upload-service.extraction.model-id` | `FILE_UPLOAD_SERVICE_EXTRACTION_MODEL_ID` | blank = extraction off; the Bedrock model's id or ARN |
+| `file-upload-service.extraction.max-tokens` / `.timeout` | `…_EXTRACTION_MAX_TOKENS` / `_TIMEOUT` | `2000` / `60s` per model call |
+| `file-upload-service.extraction.max-attempts` / `.retry-backoff` | `…_EXTRACTION_MAX_ATTEMPTS` / `_RETRY_BACKOFF` | `3` / `30s` (× attempt) |
+| `file-upload-service.extraction.lease` | `FILE_UPLOAD_SERVICE_EXTRACTION_LEASE` | `3m`: a dead worker's file is taken over after this; ≥ timeout + 10 s |
+| `file-upload-service.extraction.poll-interval` / `.concurrency` | `…_EXTRACTION_POLL_INTERVAL` / `_CONCURRENCY` | `2s` / `4` model calls per instance |
+| `file-upload-service.extraction.simulator.enabled` / `.delay` | `FILE_UPLOAD_SERVICE_EXTRACTION_SIMULATOR` / `_DELAY` | `false` / `1s`; local only, refused in production |
+| `file-upload-service.aws.bedrock-endpoint` | `FILE_UPLOAD_SERVICE_BEDROCK_ENDPOINT` | blank = AWS (a VPC endpoint URL if DNS doesn't resolve it) |
 | `file-upload-service.scan.simulator.enabled` / `.delay` | `FILE_UPLOAD_SERVICE_SCAN_SIMULATOR` / `_DELAY` | `false` / `3s`; local only, refused in production |
 | `file-upload-service.aws.region` | `FILE_UPLOAD_SERVICE_AWS_REGION` | blank = the SDK's chain (`AWS_REGION`) |
 | `file-upload-service.aws.s3-endpoint` / `.sqs-endpoint` / `.dynamodb-endpoint` | `FILE_UPLOAD_SERVICE_S3_ENDPOINT` / `_SQS_ENDPOINT` / `_DYNAMODB_ENDPOINT` | blank = AWS; emulators only (refused in production) |
@@ -386,6 +456,10 @@ Logs are built for production support and log processors (ELK, Splunk, New Relic
 | `file-upload-service.files.time-to-available` | timer, p50/p95/p99 | `method`: from landing to available, what callers wait |
 | `file-upload-service.events.wait` | timer, p50/p95/p99 | time an event waited in SQS before the service took it (queue backlog) |
 | `file-upload-service.events` | counter | `outcome` (`handled`, `failed`, `unrecognised`, `unknown_file`) |
+| `file-upload-service.extraction.pending` | gauge | opted-in files available and waiting for or in extraction, across all instances |
+| `file-upload-service.extraction.model.calls` | timer, p50/p95/p99 | `outcome` (`success`, `retry`, `failed`): each attempt (read, model call, parse) |
+| `file-upload-service.extraction.time-to-complete` | timer, p50/p95/p99 | from the file becoming available to its policy being stored |
+| `file-upload-service.extraction.tokens` | counter | `direction` (`input`, `output`): Bedrock tokens (cost) |
 | `file-upload-service.recovery` | counter | `action` (`promotion_resumed`, `result_from_tag`): files [crash recovery](#crash-safety) finished |
 | `file-upload-service.aws.requests` | timer, p50/p95/p99 | `service`, `operation`, `outcome`: every AWS call with its retries; SQS `ReceiveMessage` includes its long-poll wait |
 
@@ -448,6 +522,31 @@ racing retries and concurrent duplicates: every file ended in the right status, 
 or promoted twice, and no object was left without a record. The scenarios are in
 [`docs/test-scenarios.md`](docs/test-scenarios.md) ("CR" and "ID").
 
+### Testing against real AWS
+
+`./gradlew test` never touches AWS: S3, SQS, DynamoDB and Bedrock are mocked (or emulated for local
+runs). **`./gradlew integrationTest`** (`src/integrationTest/java`) runs against a real account, and
+refuses to start until one is configured. It isn't part of `test`, `check` or `build`.
+
+| Setting | Needed by |
+|---|---|
+| AWS credentials (`AWS_PROFILE`, SSO or the default chain) | all |
+| `FILE_UPLOAD_SERVICE_IT_REGION` | all |
+| `FILE_UPLOAD_SERVICE_IT_BEDROCK_MODEL_ID` | `BedrockPolicyExtractionIT`: the real model reads a policy schedule drawn in memory (known values, no real person's data) |
+| `FILE_UPLOAD_SERVICE_IT_QUARANTINE_BUCKET`, `_CLEAN_BUCKET` | `S3StorageIT`: S3 refuses presigned PUTs with another type, length or no `If-None-Match` (403) and a second PUT (412); streaming, promotion by ETag, download links |
+| `FILE_UPLOAD_SERVICE_IT_TABLE` | `FileRepositoryIT`: every conditional transition, the in-flight index, the extraction lease and takeover |
+| `FILE_UPLOAD_SERVICE_IT_GUARDDUTY=true` (with the buckets) | `GuardDutyScanIT`: real scans of a clean file and of the EICAR test file (minutes, charged) |
+
+```bash
+AWS_PROFILE=file-upload-test FILE_UPLOAD_SERVICE_IT_REGION=ap-southeast-2 \
+FILE_UPLOAD_SERVICE_IT_BEDROCK_MODEL_ID=arn:aws:bedrock:… ./gradlew integrationTest --tests '*Bedrock*'
+```
+
+A test missing a setting it needs **fails** naming it (except the opt-in GuardDuty scans): a silent
+skip would pass without testing anything. Use **dedicated test resources** created from
+`deploy/aws/`: uploads land in the quarantine bucket, where GuardDuty scans them and a deployed
+service would see their events. Objects and items are removed afterwards.
+
 ## Data
 
 DynamoDB table `file-upload-service-files` ([`deploy/aws/dynamodb-table.json`](deploy/aws/dynamodb-table.json)),
@@ -464,6 +563,10 @@ one item per file:
 | `scannedETag` | S | The version GuardDuty scanned: promotion copies only that version, and a promotion a crash interrupted resumes with it |
 | `expiresAt` | N | Epoch seconds; DynamoDB's TTL deletes a record whose upload never came, 15 days after its URL expires (longer than any of its events can wait in SQS). Removed once the file lands |
 | `overdueReportedAt` | N | Set by the one instance that reported the scan overdue |
+| `extraction` | S | `INSURANCE_POLICY` when the uploader opted in |
+| `extractionStatus`, `extractionRequestedAt`, `extractionCompletedAt`, `extractionAttempts` | S, N, N, N | The [extraction](#policy-extraction); while `PENDING`, `stage` is `EXTRACTING` |
+| `leaseUntil`, `extractionLastError` | N, S | The claiming worker's lease (or the wait before a retry), and the last temporary error |
+| `extractionModel`, `extractionResult`, `extractionFailure` | S | The model that answered, the policy as JSON (**personal data**), or why it failed |
 
 ## Layout
 
@@ -479,6 +582,8 @@ com.crisinis.fileuploadservice
 ├── storage/      FileStorage: S3 presigning, streaming, promotion
 ├── persistence/  FileRepository: DynamoDB records and the in-flight index
 ├── events/       SQS consumer, EventBridge event parser, the local GuardDuty simulator
+├── extraction/   policy extraction: BedrockPolicyModel (Converse), PolicyParser, ExtractionWorker,
+│                 ExtractionResults, SimulatedBedrock (local)
 └── web/          FileController, FileView, ApiExceptionHandler, RequestIdFilter
 ```
 
@@ -537,6 +642,11 @@ request as the change.
 | Records kept 15 days before TTL | Longer than SQS (4 days) and its dead-letter queue (14) can hold an upload's event, so no event finds its record gone | Abandoned uploads' records linger 15 days (a few hundred bytes each) |
 | Copy inside S3 to promote | No bytes through the service; one request | Single-request copy limits files to 5 GB (`max-size` enforces it) |
 | A GuardDuty simulator in the service | No emulator offers GuardDuty or EventBridge; the demo runs end to end on a laptop | Code that must never run in production (refused by production mode) |
+| Extraction inside this service, opt-in per upload | Decided with the team: no new deployable; only opted-in files cost a model call | Bedrock latency and quotas share the pods with uploads (`extraction.concurrency` bounds it) |
+| DynamoDB leases as the extraction queue, not a new SQS queue | The record already holds the state; the in-flight index finds pending work; a lease gives exactly one worker and takeover on crash | Workers poll every 2 s; fine for the volumes expected, revisit beyond hundreds a second |
+| Converse API, prompt in a resource file | One API for foundation, fine-tuned and imported models; the prompt is reviewed like code | Models that need a custom body would need InvokeModel |
+| Validate the answer field by field | An answer is untrusted text: a bad field is dropped with a warning, the rest kept | Callers must read `confidence` and `warnings` |
+| Refuse unsupported files at upload | Bedrock's formats and sizes are known up front | HEIC/TIFF policies must be converted by the front-end first |
 | REST only, no gRPC API | Clients upload files over HTTP; one protocol, one port, one ALB target group | Clients that want gRPC call the REST API instead |
 
 ### Patterns

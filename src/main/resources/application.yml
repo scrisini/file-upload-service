@@ -73,6 +73,8 @@ file-upload-service:
     s3-presign-endpoint: ${FILE_UPLOAD_SERVICE_S3_PRESIGN_ENDPOINT:}
     sqs-endpoint: ${FILE_UPLOAD_SERVICE_SQS_ENDPOINT:}
     dynamodb-endpoint: ${FILE_UPLOAD_SERVICE_DYNAMODB_ENDPOINT:}
+    # Bedrock Runtime: a VPC endpoint URL if one isn't resolved by DNS; blank for AWS
+    bedrock-endpoint: ${FILE_UPLOAD_SERVICE_BEDROCK_ENDPOINT:}
     timeout: ${FILE_UPLOAD_SERVICE_AWS_TIMEOUT:10s}
   # Uploads land in the quarantine bucket (GuardDuty Malware Protection protects it); clean files
   # move to the clean bucket. Records of every file are in the DynamoDB table.
@@ -103,6 +105,21 @@ file-upload-service:
     simulator:
       enabled: ${FILE_UPLOAD_SERVICE_SCAN_SIMULATOR:false}
       delay: ${FILE_UPLOAD_SERVICE_SCAN_SIMULATOR_DELAY:3s}
+  # Insurance-policy extraction for uploads that opt in (README "Policy extraction"): workers send
+  # each opted-in file, once AVAILABLE, to the model on Amazon Bedrock. Blank model = off.
+  extraction:
+    model-id: ${FILE_UPLOAD_SERVICE_EXTRACTION_MODEL_ID:}
+    max-tokens: ${FILE_UPLOAD_SERVICE_EXTRACTION_MAX_TOKENS:2000}
+    timeout: ${FILE_UPLOAD_SERVICE_EXTRACTION_TIMEOUT:60s}
+    max-attempts: ${FILE_UPLOAD_SERVICE_EXTRACTION_MAX_ATTEMPTS:3}
+    retry-backoff: ${FILE_UPLOAD_SERVICE_EXTRACTION_RETRY_BACKOFF:30s}
+    lease: ${FILE_UPLOAD_SERVICE_EXTRACTION_LEASE:3m}
+    poll-interval: ${FILE_UPLOAD_SERVICE_EXTRACTION_POLL_INTERVAL:2s}
+    concurrency: ${FILE_UPLOAD_SERVICE_EXTRACTION_CONCURRENCY:4}
+    # Local stand-in for Bedrock (scripts/dev.sh turns it on); production refuses it
+    simulator:
+      enabled: ${FILE_UPLOAD_SERVICE_EXTRACTION_SIMULATOR:false}
+      delay: ${FILE_UPLOAD_SERVICE_EXTRACTION_SIMULATOR_DELAY:1s}
   # Proxy for all outgoing connections to external hosts; blank host = direct.
   outbound-proxy:
     type: ${FILE_UPLOAD_SERVICE_PROXY_TYPE:HTTP}     # HTTP (tinyproxy, Squid) or SOCKS

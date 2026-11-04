@@ -13,6 +13,9 @@
 # Each upload carries an Idempotency-Key, printed so it can be replayed: run again with
 # IDEMPOTENCY_KEY=<key> to retry the same upload (the answer says Idempotent-Replayed: true), or
 # IDEMPOTENCY_KEY= (empty) to send none.
+#
+# EXTRACT=INSURANCE_POLICY opts the file in to policy extraction; once the file is AVAILABLE the
+# script follows the extraction on the internal endpoint and prints the policy.
 
 set -euo pipefail
 
@@ -50,12 +53,20 @@ if [ -n "$IDEMPOTENCY_KEY" ]; then
     printf '==> Idempotency-Key: %s (IDEMPOTENCY_KEY=%s replays this upload)\n' "$IDEMPOTENCY_KEY" "$IDEMPOTENCY_KEY"
 fi
 
+extract_json=""
+extract_query=""
+if [ -n "${EXTRACT:-}" ]; then
+    extract_json=",\"extract\":\"$EXTRACT\""
+    extract_query="&extract=$EXTRACT"
+    printf '==> extract: %s\n' "$EXTRACT"
+fi
+
 case "$style" in
     presigned)
         printf '==> POST /api/v1/uploads (%s, %s bytes)\n' "$type" "$size"
         response="$(curl -sS -D "$headers" -X POST "$BASE/api/v1/uploads" -H 'Content-Type: application/json' \
             "${key_header[@]}" \
-            -d "{\"fileName\":\"$name\",\"contentType\":\"$type\",\"size\":$size}")"
+            -d "{\"fileName\":\"$name\",\"contentType\":\"$type\",\"size\":$size$extract_json}")"
         printf '%s' "$response" | show
         replayed
         id="$(field "$response" id)"
@@ -70,7 +81,7 @@ case "$style" in
         ;;
     stream)
         printf '==> POST /api/v1/files (%s, %s bytes, through the service)\n' "$type" "$size"
-        response="$(curl -sS -D "$headers" -X POST "$BASE/api/v1/files?fileName=$name" -H "Content-Type: $type" \
+        response="$(curl -sS -D "$headers" -X POST "$BASE/api/v1/files?fileName=$name$extract_query" -H "Content-Type: $type" \
             "${key_header[@]}" --data-binary "@$file")"
         printf '%s' "$response" | show
         replayed
@@ -90,8 +101,28 @@ for _ in $(seq 1 60); do
         last="$status"
     fi
     case "$status" in
-        AVAILABLE|INFECTED|REJECTED|NOT_SCANNED) printf '%s' "$current" | show; exit 0 ;;
+        AVAILABLE|INFECTED|REJECTED|NOT_SCANNED) printf '%s' "$current" | show; break ;;
     esac
     sleep 1
 done
-die "still $last after 60 s"
+case "$last" in
+    AVAILABLE|INFECTED|REJECTED|NOT_SCANNED) ;;
+    *) die "still $last after 60 s" ;;
+esac
+[ -n "${EXTRACT:-}" ] || exit 0
+
+printf '==> GET /internal/v1/files/%s/extraction until it ends (internal endpoint)\n' "$id"
+last=""
+for _ in $(seq 1 120); do
+    current="$(curl -sS "$BASE/internal/v1/files/$id/extraction")"
+    status="$(field "$current" status)"
+    if [ "$status" != "$last" ]; then
+        printf '    %s  %s\n' "$(date +%H:%M:%S)" "$status"
+        last="$status"
+    fi
+    case "$status" in
+        COMPLETED|FAILED|NOT_EXTRACTED) printf '%s' "$current" | show; exit 0 ;;
+    esac
+    sleep 1
+done
+die "extraction still $last after 120 s"

@@ -39,7 +39,7 @@ class ScanMonitorTests {
     @Test
     void countsScansInProgressAndReportsEachOverdueScanOnce() {
         when(files.countScanning()).thenReturn(7L);
-        when(files.inStageSince(FileStatus.SCANNING, NOW.minus(Duration.ofMinutes(5)), 100)).thenReturn(List.of("a", "b"));
+        when(files.inStageSince(FileRepository.Stage.SCANNING, NOW.minus(Duration.ofMinutes(5)), 100)).thenReturn(List.of("a", "b"));
         when(files.claimOverdueReport("a", NOW)).thenReturn(true);
         when(files.claimOverdueReport("b", NOW)).thenReturn(false);  // another instance reported it
 

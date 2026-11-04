@@ -175,7 +175,8 @@ public class ScanOutcomes {
     /** Ends the promotion: AVAILABLE when {@code rejection} is null, otherwise REJECTED for that reason. */
     private void finish(FileRecord file, String rejection) {
         FileStatus outcome = rejection == null ? FileStatus.AVAILABLE : FileStatus.REJECTED;
-        Optional<Update> update = files.finishPromotion(file.id(), outcome, clock.instant(), rejection);
+        Optional<Update> update = files.finishPromotion(file.id(), outcome, clock.instant(), rejection,
+                file.extraction() != null);
         if (update.isEmpty() || !update.get().changed()) {
             return;
         }
