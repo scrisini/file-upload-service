@@ -50,7 +50,7 @@ class ExtractionWorkerTests {
     private final JsonMapper json = JsonMapper.builder().build();
     private final ExtractionWorker worker = new ExtractionWorker(files, storage, model, new PolicyParser(json), json,
             TestProperties.of(Map.of("file-upload-service.extraction.model-id", "model-1")),
-            Clock.fixed(NOW, ZoneOffset.UTC), registry);
+            Clock.fixed(NOW, ZoneOffset.UTC), registry, Duration.ofSeconds(30));
 
     static Claim claim(int attempt) {
         return new Claim(new FileRecord(ID, "policy.png", FileType.PNG, 4, UploadMethod.STREAM, FileStatus.AVAILABLE,
@@ -148,9 +148,42 @@ class ExtractionWorkerTests {
     }
 
     @Test
+    void onShutdownAnExtractionStillRunningIsHandedBackWithoutUsingAnAttempt() throws Exception {
+        java.util.concurrent.CountDownLatch calling = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        when(storage.readClean(any(), anyLong())).thenReturn(Optional.of(PNG));
+        when(model.read(any(), any())).thenAnswer(call -> {
+            calling.countDown();
+            release.await(5, java.util.concurrent.TimeUnit.SECONDS);   // a slow model call
+            return new BedrockPolicyModel.Answer(SamplePolicy.JSON, 1, 1);
+        });
+        when(files.releaseExtraction(ID, NOW)).thenReturn(true);
+        Thread call = Thread.ofVirtual().start(() -> worker.extract(claim(1)));
+        assertThat(calling.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+
+        assertThat(worker.handOver()).isEqualTo(1);
+
+        verify(files).releaseExtraction(ID, NOW);
+        release.countDown();
+        call.join(5000);
+        // and once it's done, nothing is left to hand over
+        assertThat(worker.handOver()).isZero();
+    }
+
+    @Test
+    void stoppingAWorkerThatNeverStartedReturnsAtOnce() {
+        java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean();
+
+        worker.stop(() -> done.set(true));
+
+        assertThat(done).isTrue();
+        assertThat(worker.getPhase()).isEqualTo(com.crisinis.fileuploadservice.config.GracefulShutdown.DRAIN_PHASE);
+    }
+
+    @Test
     void withoutAModelItDoesntStart() {
         ExtractionWorker off = new ExtractionWorker(files, storage, model, new PolicyParser(json), json,
-                TestProperties.defaults(), Clock.fixed(NOW, ZoneOffset.UTC), new SimpleMeterRegistry());
+                TestProperties.defaults(), Clock.fixed(NOW, ZoneOffset.UTC), new SimpleMeterRegistry(), Duration.ofSeconds(30));
 
         off.start();
 

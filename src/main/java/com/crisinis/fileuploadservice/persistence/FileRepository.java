@@ -272,6 +272,25 @@ public class FileRepository {
         }
     }
 
+    /**
+     * Hands a claimed extraction back on shutdown: its lease ends now, so any instance can take it
+     * at once rather than when the lease would have run out, and the attempt doesn't count.
+     *
+     * @return false if it had already ended (the call finished meanwhile)
+     */
+    public boolean releaseExtraction(String id, Instant now) {
+        try {
+            rawUpdate("releaseExtraction", UpdateItemRequest.builder().key(key(id))
+                    .updateExpression("SET leaseUntil = :now ADD extractionAttempts :minusOne")
+                    .conditionExpression("stage = :extracting AND extractionAttempts > :zero")
+                    .expressionAttributeValues(Map.of(":now", n(now.toEpochMilli()), ":minusOne", n(-1), ":zero", n(0),
+                            ":extracting", s(Stage.EXTRACTING.name()))));
+            return true;
+        } catch (ConditionalCheckFailedException ended) {
+            return false;
+        }
+    }
+
     /** The file's extraction; empty if the file doesn't exist or wasn't to be extracted. */
     public Optional<StoredExtraction> findExtraction(String id) {
         Map<String, AttributeValue> item = call("GetItem",

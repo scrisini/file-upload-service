@@ -21,6 +21,12 @@ promotes clean files. README "File lifecycle" has the states.
   keep in the record whatever finishing a step needs (like `scannedETag`), and never delete a record
   while an event for it may still arrive. A new in-flight status joins the `in-flight` index and
   `InFlightRecovery`, and gets a `kill -9` test against the local stack.
+- **Graceful shutdown** (README "Graceful shutdown"): a background worker is a `SmartLifecycle` in
+  `GracefulShutdown.DRAIN_PHASE` with an asynchronous `stop(callback)`: stop taking work, finish what's
+  in hand within `GracefulShutdown.drainBudget`, hand the rest to other instances (release, never
+  drop), log 1018, then call back. Never block shutdown past the budget; never create AWS clients
+  outside `AwsClients` (they're closed there). Changing the phase timeout means changing the
+  container stop timeouts too (docs/deployment.md "Timeouts").
 - **Retries are idempotent** (`Idempotency-Key`, README "Idempotent retries"): the key decides the
   file id, so creation is `createIfAbsent` and a write to quarantine that finds an object
   (`If-None-Match`) is a replay, not an error. Keep both upload styles that way.

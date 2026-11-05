@@ -7,6 +7,8 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
 
@@ -29,7 +31,7 @@ class ScanEventConsumerTests {
     private final ScanOutcomes outcomes = mock(ScanOutcomes.class);
     private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
     private final ScanEventConsumer consumer = new ScanEventConsumer(sqs, new ScanEventParser(JsonMapper.builder().build()),
-            outcomes, TestProperties.of(Map.of("file-upload-service.scan.queue-url", QUEUE)), registry);
+            outcomes, TestProperties.of(Map.of("file-upload-service.scan.queue-url", QUEUE)), registry, Duration.ofSeconds(30));
 
     static Message message(String body) {
         return Message.builder().messageId("m-1").receiptHandle("r-1").body(body)
@@ -76,9 +78,35 @@ class ScanEventConsumerTests {
     }
 
     @Test
+    void onShutdownTheMessagesNotYetStartedAreReleasedToOtherInstances() {
+        ScanEventConsumer stopping = new ScanEventConsumer(sqs, new ScanEventParser(JsonMapper.builder().build()), outcomes,
+                TestProperties.of(Map.of("file-upload-service.scan.queue-url", QUEUE)), new SimpleMeterRegistry(),
+                Duration.ofSeconds(1));
+        // never started, so it isn't running: as after stop() was called
+        java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean();
+        stopping.stop(() -> done.set(true));
+
+        stopping.handle(List.of(message(CLEAN), message(CLEAN), message(CLEAN)));
+
+        org.mockito.ArgumentCaptor<java.util.function.Consumer<software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityBatchRequest.Builder>> release =
+                org.mockito.ArgumentCaptor.forClass(java.util.function.Consumer.class);
+        verify(sqs).changeMessageVisibilityBatch(release.capture());
+        var request = software.amazon.awssdk.services.sqs.model.ChangeMessageVisibilityBatchRequest.builder();
+        release.getValue().accept(request);
+        assertThat(request.build().entries()).hasSize(3).allSatisfy(e -> assertThat(e.visibilityTimeout()).isZero());
+        verify(outcomes, never()).handle(any());
+        assertThat(done).isTrue();
+    }
+
+    @Test
+    void drainsInTheWebServersGracefulShutdownPhase() {
+        assertThat(consumer.getPhase()).isEqualTo(com.crisinis.fileuploadservice.config.GracefulShutdown.DRAIN_PHASE);
+    }
+
+    @Test
     void withoutAQueueItDoesNotStart() {
         ScanEventConsumer off = new ScanEventConsumer(sqs, new ScanEventParser(JsonMapper.builder().build()), outcomes,
-                TestProperties.defaults(), new SimpleMeterRegistry());
+                TestProperties.defaults(), new SimpleMeterRegistry(), Duration.ofSeconds(30));
 
         off.start();
 
