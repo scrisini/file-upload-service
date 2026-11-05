@@ -770,3 +770,29 @@ and the `commitlint` workflow checks every pull request's commits and title.
 - `scripts/github-branch-rules.sh` enforces this on GitHub; run it without arguments for a dry run.
   Rulesets need GitHub Pro or Team for a private repository; without them, follow these rules by
   hand and only merge a pull request once its `commitlint` check has passed.
+
+### Git shortcuts
+
+`scripts/git-shortcuts.sh` adds two commands for the steps above to zsh or bash. Each one fetches
+first, says exactly what it will change, and asks before changing anything (the default is no).
+
+```bash
+scripts/git-shortcuts.sh --install     # adds `source …/git-shortcuts.sh` to ~/.zshrc or ~/.bashrc (asks first)
+grebase-remote [branch]                # rebase the current feature branch onto origin/<branch> (default develop)
+gbackmerge                             # back-merge main into develop: a PR, merged with a merge commit
+gshortcuts                             # list them
+```
+
+- **`grebase-remote`** shows the commits coming in, your commits that get replayed (with new ids),
+  the files expected to conflict, and whether the branch is already pushed: then the history differs
+  from the remote's, a push needs `--force-with-lease` (it asks separately), and it warns about
+  commits on the remote you don't have. It refuses on `main` and `develop`, and with uncommitted
+  changes. The convention above is to *merge* `origin/develop` into a work branch, which keeps commit
+  ids; rebase only branches no one else uses.
+- **`gbackmerge`** shows `main`'s commits `develop` lacks and the files the merge would change
+  (normally none after a release squash), then opens the pull request `main` → `develop` and,
+  after a second yes, merges it with a merge commit. With conflicts it changes nothing and prints
+  the helper-branch steps instead. It needs `gh`, signed in.
+
+Settings: `GS_REMOTE`, `GS_MAIN`, `GS_DEVELOP`. Test them after a change with
+`scripts/test-git-shortcuts.sh` (throwaway repositories, zsh and bash, `gh` stubbed).
