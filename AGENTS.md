@@ -67,6 +67,7 @@ scripts/dev.sh docker [args...] # the same with the app in Docker, built as prod
 scripts/try-upload.sh presigned|stream <file>   # upload and follow it (IDEMPOTENCY_KEY=… replays)
 scripts/send-scan-event.sh ...  # inject S3/GuardDuty events into the local queue (simulator off)
 ./gradlew integrationTest      # against REAL AWS; needs FILE_UPLOAD_SERVICE_IT_* (README "Testing against real AWS")
+scripts/test-git-shortcuts.sh  # test grebase-remote / gbackmerge (README "Git shortcuts") after changing them
 scripts/dev.sh status          # dependency and app health
 scripts/dev.sh hooks           # install the git hooks: commit messages, plaintext secrets (once per clone)
 scripts/test-commit-msg.sh     # test the hook after changing it or .commitlintrc.json
