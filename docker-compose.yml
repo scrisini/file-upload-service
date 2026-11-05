@@ -33,6 +33,9 @@ services:
       AWS_SECRET_ACCESS_KEY: local
       # the image's launcher prints a memory report to stdout at exit (docs/deployment.md)
       BPL_JAVA_NMT_ENABLED: "false"
+    # SIGTERM, then this long to drain before SIGKILL (Docker's default, 10 s, would cut the drain short;
+    # README "Graceful shutdown")
+    stop_grace_period: 45s
     # as on Kubernetes: nothing to write but a small in-memory /tmp for Tomcat and the JVM
     read_only: true
     tmpfs:

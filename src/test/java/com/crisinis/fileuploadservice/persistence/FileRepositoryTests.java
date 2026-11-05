@@ -137,6 +137,17 @@ class FileRepositoryTests {
     }
 
     @Test
+    void handingAnExtractionBackEndsTheLeaseNowAndReturnsTheAttempt() {
+        ArgumentCaptor<UpdateItemRequest> update = ArgumentCaptor.forClass(UpdateItemRequest.class);
+        when(dynamo.updateItem(update.capture())).thenReturn(UpdateItemResponse.builder().attributes(item(FileStatus.AVAILABLE)).build());
+
+        assertThat(repository.releaseExtraction(ID, AT)).isTrue();
+
+        assertThat(update.getValue().updateExpression()).isEqualTo("SET leaseUntil = :now ADD extractionAttempts :minusOne");
+        assertThat(update.getValue().conditionExpression()).isEqualTo("stage = :extracting AND extractionAttempts > :zero");
+    }
+
+    @Test
     void endingAnExtractionLeavesTheInFlightIndex() {
         ArgumentCaptor<UpdateItemRequest> update = ArgumentCaptor.forClass(UpdateItemRequest.class);
         when(dynamo.updateItem(update.capture())).thenReturn(UpdateItemResponse.builder().attributes(item(FileStatus.AVAILABLE)).build());

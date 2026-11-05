@@ -8,9 +8,13 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.crisinis.fileuploadservice.config.FileUploadServiceProperties;
+import com.crisinis.fileuploadservice.config.GracefulShutdown;
 import com.crisinis.fileuploadservice.logging.LogEvent;
 import com.crisinis.fileuploadservice.model.FileRecord;
 import com.crisinis.fileuploadservice.model.PolicyExtraction;
@@ -23,6 +27,7 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.json.JsonMapper;
@@ -34,7 +39,9 @@ import tools.jackson.databind.json.JsonMapper;
  * store the policy. Nothing is held in memory between files.
  *
  * <p>Crash safety: a worker that dies leaves its claim to expire ({@code extraction.lease}), and
- * another worker takes the file over. Temporary failures wait {@code retry-backoff × attempt} and
+ * another worker takes the file over. On a graceful shutdown (README "Graceful shutdown") the
+ * workers drain alongside HTTP requests: no new claims, calls in progress may finish within the
+ * drain budget, and any still running then are handed back at once, without using up an attempt. Temporary failures wait {@code retry-backoff × attempt} and
  * retry; after {@code max-attempts} calls, or a permanent failure, the extraction is FAILED.
  */
 @Slf4j
@@ -56,10 +63,16 @@ public class ExtractionWorker implements SmartLifecycle {
     private final Counter outputTokens;
     private final Timer timeToComplete;
     private final List<Thread> workers = new ArrayList<>();
+    private final Duration drainBudget;
+    /** Extractions in progress on this instance, to hand back if shutdown can't wait for them. */
+    private final Map<String, Claim> inProgress = new ConcurrentHashMap<>();
+    private final AtomicInteger finishedWhileStopping = new AtomicInteger();
     private volatile boolean running;
 
     public ExtractionWorker(FileRepository files, FileStorage storage, BedrockPolicyModel model, PolicyParser parser,
-                            JsonMapper json, FileUploadServiceProperties properties, Clock clock, MeterRegistry registry) {
+                            JsonMapper json, FileUploadServiceProperties properties, Clock clock, MeterRegistry registry,
+                            @Value("${spring.lifecycle.timeout-per-shutdown-phase:30s}") Duration phaseTimeout) {
+        this.drainBudget = GracefulShutdown.drainBudget(phaseTimeout);
         this.files = files;
         this.storage = storage;
         this.model = model;
@@ -96,22 +109,74 @@ public class ExtractionWorker implements SmartLifecycle {
     }
 
     /**
-     * Stops claiming. Calls in progress get a few seconds; one still running when the instance stops
-     * is taken over by another instance when its lease ends.
+     * Stops claiming and drains in the background; Spring continues when {@code done} runs. Calls in
+     * progress may finish within the drain budget; any still running then are handed back.
      */
     @Override
-    public synchronized void stop() {
+    public synchronized void stop(Runnable done) {
+        if (!running) {
+            done.run();
+            return;
+        }
         running = false;
-        long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
-        for (Thread worker : workers) {
+        List<Thread> draining = List.copyOf(workers);
+        workers.clear();
+        Thread.ofVirtual().name("extraction-drain").start(() -> {
+            long started = System.nanoTime();
+            awaitAll(draining, started + drainBudget.toNanos());
+            int handedOver = handOver();
+            LogEvent.WORK_DRAINED.at(log).with("component", "extraction")
+                    .with("finished", finishedWhileStopping.get()).with("handed_over", handedOver)
+                    .with("drain_ms", (System.nanoTime() - started) / 1_000_000).log();
+            done.run();
+        });
+    }
+
+    @Override
+    public void stop() {
+        CountDownLatch stopped = new CountDownLatch(1);
+        stop(stopped::countDown);
+        try {
+            stopped.await(drainBudget.toMillis() + 5000, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Drains with the HTTP requests (README "Graceful shutdown"). */
+    @Override
+    public int getPhase() {
+        return GracefulShutdown.DRAIN_PHASE;
+    }
+
+    /** Hands back the extractions still in progress: their leases end now and their attempts don't count. */
+    int handOver() {
+        int handedOver = 0;
+        Instant now = clock.instant();
+        for (Claim claim : inProgress.values()) {
             try {
-                worker.join(Duration.ofNanos(Math.max(0, deadline - System.nanoTime())));
+                if (files.releaseExtraction(claim.file().id(), now)) {
+                    handedOver++;
+                    LogEvent.EXTRACTION_HANDED_OVER.at(log).with("file_id", claim.file().id())
+                            .with("attempt", claim.attempt()).log();
+                }
+            } catch (DependencyUnavailableException e) {
+                // its lease ends anyway and another instance takes it then
+                LogEvent.EXTRACTION_WORKER_FAILED.at(log).with("operation", e.operation()).cause(e).log();
+            }
+        }
+        return handedOver;
+    }
+
+    private static void awaitAll(List<Thread> threads, long deadline) {
+        for (Thread thread : threads) {
+            try {
+                thread.join(Duration.ofNanos(Math.max(0, deadline - System.nanoTime())));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
             }
         }
-        workers.clear();
     }
 
     @Override
@@ -131,6 +196,12 @@ public class ExtractionWorker implements SmartLifecycle {
             } catch (DependencyUnavailableException e) {
                 LogEvent.EXTRACTION_WORKER_FAILED.at(log).with("operation", e.operation()).cause(e).log();
                 pause(settings.pollInterval().multipliedBy(5));
+            } catch (RuntimeException e) {
+                if (running) {
+                    throw e;
+                }
+                // a call that outlived the drain and found the clients closed: it was handed over
+                return;
             }
         }
     }
@@ -151,6 +222,19 @@ public class ExtractionWorker implements SmartLifecycle {
 
     /** Reads, asks, stores: one attempt at one file's extraction. */
     void extract(Claim claim) {
+        inProgress.put(claim.file().id(), claim);
+        boolean stoppingAlready = !running;
+        try {
+            attempt(claim);
+        } finally {
+            inProgress.remove(claim.file().id());
+            if (!running && !stoppingAlready) {
+                finishedWhileStopping.incrementAndGet();
+            }
+        }
+    }
+
+    private void attempt(Claim claim) {
         FileRecord file = claim.file();
         if (claim.attempt() > settings.maxAttempts()) {
             // workers died holding it (each claim counts): stop before it costs more

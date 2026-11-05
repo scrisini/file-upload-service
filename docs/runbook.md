@@ -183,6 +183,46 @@ the full log lines for that request id (including `error.stack_trace`).
   model. Production mode refuses to start with it on ([1005](#file_upload_service-1005)).
 - **Check:** outside a laptop, set `FILE_UPLOAD_SERVICE_EXTRACTION_SIMULATOR=false` at once.
 
+<a id="file_upload_service-1016"></a>
+### FILE_UPLOAD_SERVICE-1016: Shutdown started
+
+- **Level:** INFO. Normal on every deploy, scale-in or node drain (SIGTERM).
+- **Means:** the instance takes no new work: Tomcat stops accepting requests, the scan consumer and
+  extraction workers stop taking messages and files, and scheduled jobs stop being triggered. Work
+  in progress gets up to `spring.lifecycle.timeout-per-shutdown-phase` (30 s) to finish (README
+  "Graceful shutdown"). Expect [1018](#file_upload_service-1018) per worker, then [1017](#file_upload_service-1017).
+- **Check:** nothing, unless [1017](#file_upload_service-1017) doesn't follow within about 45 s: the pod was killed
+  before it finished (its stop timeout is too short, docs/deployment.md "Timeouts"). Crash safety
+  still holds then; the work is finished by other instances.
+
+<a id="file_upload_service-1017"></a>
+### FILE_UPLOAD_SERVICE-1017: Work drained; the instance exits
+
+- **Level:** INFO.
+- **Means:** every worker and scheduled job has finished or handed its work over; AWS clients and
+  connections close next. `file-upload-service.shutdown_ms` is the time since [1016](#file_upload_service-1016).
+- **Check:** `shutdown_ms` near 30000 means something used the whole drain budget: a long upload or
+  a slow model call (see [1018](#file_upload_service-1018)).
+
+<a id="file_upload_service-1018"></a>
+### FILE_UPLOAD_SERVICE-1018: A worker drained for shutdown
+
+- **Level:** INFO. One per worker (`file-upload-service.component`: `scan-events`, `extraction`).
+- **Means:** in `file-upload-service.drain_ms` the worker finished `file-upload-service.finished` items it was working on and handed
+  `file-upload-service.handed_over` to other instances: scan events released back to the queue at once (not after the
+  visibility timeout), or extractions whose model call was still running at the deadline
+  ([1019](#file_upload_service-1019)).
+
+<a id="file_upload_service-1019"></a>
+### FILE_UPLOAD_SERVICE-1019: An extraction was handed over at shutdown
+
+- **Level:** WARN. Expected now and then on deploys while extractions run.
+- **Means:** the model call for `file-upload-service.file_id` didn't finish within the drain budget (the phase timeout
+  less 5 s). Its lease ended at once and its attempt doesn't count, so another instance extracts the
+  file straight away; the call here is abandoned.
+- **Check:** many per deploy: model calls are slow (`file-upload-service.extraction.model.calls` p95) against the 25 s
+  drain; consider a longer phase timeout and stop timeout together (docs/deployment.md "Timeouts").
+
 ## Uploads and scans (2xxx)
 
 A file moves `AWAITING_UPLOAD` → `SCANNING` → `PROMOTING` → `AVAILABLE`, or ends `INFECTED`,

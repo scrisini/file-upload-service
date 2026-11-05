@@ -20,6 +20,7 @@ explains it. Keep it current: add a row in the same pull request as the feature.
 | Accepted files | JPEG, PNG, GIF, WebP, HEIC, TIFF and PDF up to 25 MB (`uploads.allowed-types`, `uploads.max-size`); the declared type and the content's signature must agree | [File lifecycle](#file-lifecycle) |
 | Malware scanning | GuardDuty Malware Protection for S3 scans every upload in the quarantine bucket; results arrive through EventBridge and SQS | [File lifecycle](#file-lifecycle), [AWS resources](docs/deployment.md#aws-resources) |
 | Promotion | Clean files are copied inside S3 to the clean bucket (only the version scanned) and removed from quarantine; infected and unscanned files are never served | [File lifecycle](#file-lifecycle) |
+| Graceful shutdown | On SIGTERM, in-flight requests, scan events, extractions and scheduled jobs finish or are handed to other instances within 30 s, then every AWS client closes; each step logged | [Graceful shutdown](#graceful-shutdown) |
 | Crash safety | A kill or crash at any point leaves a state another instance finishes: events are redelivered, and a recovery job resumes interrupted promotions and applies results from GuardDuty's object tags | [Crash safety](#crash-safety) |
 | Idempotent retries | An `Idempotency-Key` header makes a retried upload return the file its first attempt created, so a lost answer never produces a second copy; concurrent duplicates store one file | [Idempotent retries](#idempotent-retries) |
 | Policy extraction | Uploads that opt in (`extract=INSURANCE_POLICY`) are read by a model on Amazon Bedrock once they're available; the policy (insurer, number, holder, dates, premium, cover…) with a confidence per field is stored for internal systems only | [Policy extraction](#policy-extraction) |
@@ -303,6 +304,8 @@ so a caller can quote it to support.
 | `file-upload-service.aws.s3-presign-endpoint` | `FILE_UPLOAD_SERVICE_S3_PRESIGN_ENDPOINT` | blank = `s3-endpoint`; the S3 address in presigned URLs when browsers reach the emulator by another name (the app in Docker); refused in production |
 | `file-upload-service.aws.timeout` | `FILE_UPLOAD_SERVICE_AWS_TIMEOUT` | `10s` per AWS call (a streamed PUT has `stream-timeout`) |
 | `spring.servlet.multipart.enabled` | | `false`: multipart parsing would spool to disk |
+| `spring.lifecycle.timeout-per-shutdown-phase` | | `30s`: the drain on SIGTERM ([Graceful shutdown](#graceful-shutdown)); change with the stop timeouts |
+| `spring.task.scheduling.shutdown.await-termination-period` | | `10s` for running scheduled jobs on shutdown |
 | `springdoc.api-docs.enabled`, `springdoc.swagger-ui.enabled` | `FILE_UPLOAD_SERVICE_API_DOCS` | `true`; must be `false` in production ([API documentation](#api-documentation)) |
 | `logging.structured.format.console` | `FILE_UPLOAD_SERVICE_LOG_FORMAT` | blank = readable text; `ecs` for ECS JSON in production |
 | `logging.structured.ecs.service.environment` | `FILE_UPLOAD_SERVICE_ENVIRONMENT` | `local` |
@@ -493,6 +496,40 @@ stateDiagram-v2
   uploads can't overwrite an object (`If-None-Match: *`), so the file served is the file scanned.
 - Infected and unscanned files stay in quarantine, are never served, and expire after 30 days
   (bucket lifecycle rule). An unscanned file counts as unsafe.
+
+### Graceful shutdown
+
+On SIGTERM (a deploy, scale-in, node drain, `docker stop`, Ctrl-C) the service uses Spring Boot's
+graceful shutdown to finish what it's doing, hand over what it can't, and close every resource,
+within a fixed budget. Each step is logged ([1016](docs/runbook.md#file_upload_service-1016)–[1019](docs/runbook.md#file_upload_service-1019)).
+
+| Order | What stops | How (Spring Boot support) | Bounded by |
+|---|---|---|---|
+| 1 | New work: requests, scan events, extraction claims, scheduled triggers | `ContextClosedEvent`; Tomcat stops accepting (`server.shutdown: graceful`) | — |
+| 2 | **In parallel:** in-flight HTTP requests (uploads, status reads); the scan consumer; extraction workers | Tomcat's graceful phase, and the workers' `SmartLifecycle.stop(callback)` in the **same phase** (`GracefulShutdown.DRAIN_PHASE`), so one timeout covers them all | `spring.lifecycle.timeout-per-shutdown-phase` (30 s); workers keep 5 s of it to report and hand over |
+| 3 | Scheduled jobs (scan monitor, recovery) already running | The scheduler's lifecycle pauses and waits for them | `spring.task.scheduling.shutdown.await-termination-period` (10 s) |
+| 4 | Resources: AWS SDK clients and their HTTP connections (S3, SQS, DynamoDB, Bedrock) | Bean destruction (`destroyMethod = "close"`), after every phase above | — |
+
+What each worker does when asked to stop:
+
+- **Scan consumer:** stops receiving; the event in hand is finished; events received but not
+  started are **released** to the queue at once (visibility 0) instead of waiting out the visibility
+  timeout.
+- **Extraction workers:** stop claiming; a model call in progress may finish within the budget
+  (25 s); one still running then is **handed over**: its lease ends at once and its attempt doesn't
+  count, so another instance extracts the file straight away (instead of after the 3-minute lease).
+- **Uploads:** an upload in flight finishes within the 30 s phase (a 20 MB stream takes seconds);
+  one that can't is cut, and the caller retries with its `Idempotency-Key`.
+
+The container's stop timeout must cover it all: on Kubernetes the 20 s `preStop` + 30 s drain + 10 s
+scheduled jobs + closing fit the 75 s `terminationGracePeriodSeconds`
+([Timeouts](docs/deployment.md#timeouts)); `docker-compose.yml` gives the app 45 s (Docker's default
+is 10 s). If the instance is killed anyway, [crash safety](#crash-safety) still holds: nothing is
+lost, other instances finish the work.
+
+Measured locally with `kill -TERM`: an extraction's 10 s model call and a 20 MB upload in flight
+both finished, and the instance exited 8 s after SIGTERM; a 40 s model call was handed over at 25 s
+and finished by the restarted instance 6 s later, as attempt 1. No errors after shutdown started.
 
 ### Crash safety
 
