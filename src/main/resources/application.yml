@@ -19,8 +19,15 @@ spring:
       enabled: false
   lifecycle:
     # Each shutdown phase waits at most this long; the container's stop timeout must cover it
-    # (docs/deployment.md "Timeouts").
+    # (docs/deployment.md "Timeouts"). Workers drain in the web server's phase, within this minus 5 s
+    # (README "Graceful shutdown").
     timeout-per-shutdown-phase: 30s
+  task:
+    scheduling:
+      shutdown:
+        # Scheduled jobs (scan monitor, recovery) finish before clients close, rather than being cut off
+        await-termination: true
+        await-termination-period: 10s
 
 server:
   port: ${SERVER_PORT:8080}

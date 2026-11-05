@@ -170,7 +170,7 @@ The ALB and Tomcat must agree, or clients see 502s and dropped connections:
 ```
 ALB idle timeout (120 s)  <  keep-alive (130 s)
 preStop sleep (20 s)  <  deregistration delay (30 s)
-shutdown phase limit (30 s)  <  termination grace period (75 s)
+preStop (20 s) + drain phase (30 s) + scheduled jobs (10 s) + closing  <  termination grace period (75 s)
 ```
 
 | Setting | Where | Value | Why |
@@ -180,6 +180,8 @@ shutdown phase limit (30 s)  <  termination grace period (75 s)
 | **Deregistration delay** | target group | **30 s** | How long a stopping instance keeps its connections after the ALB stops sending it new requests |
 | **preStop sleep** | pod spec | **20 s** | Kubernetes sends SIGTERM straight away, while the ALB may still route to the pod for a few seconds |
 | **Shutdown phase limit** | `spring.lifecycle.timeout-per-shutdown-phase` | 30 s | Upper limit for each shutdown step, starting with finishing in-flight requests |
+| **Drain budget** | `GracefulShutdown` | 25 s | Workers (scan consumer, extraction) finish or hand over within the phase limit less 5 s, alongside HTTP requests (README "Graceful shutdown") |
+| **Scheduled jobs** | `spring.task.scheduling.shutdown.await-termination-period` | 10 s | Running scan-monitor and recovery jobs finish before clients close |
 | **Termination grace period** | `terminationGracePeriodSeconds` | **75 s** | After this the container is killed; it includes the 20 s `preStop` |
 | **Startup probe** | pod spec | up to 3 min | Time to start before health checks count |
 

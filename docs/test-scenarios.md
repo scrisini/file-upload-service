@@ -32,7 +32,8 @@ area names the test classes, so testers can focus on the end-to-end paths and th
 13. [Non-functional: no filesystem, memory, load, shutdown (NF)](#non-functional-no-filesystem-memory-load-shutdown-nf)
 14. [AWS-only scenarios (AW)](#aws-only-scenarios-aw)
 15. [Policy extraction (EX)](#policy-extraction-ex)
-16. [Integration tests against real AWS (IT)](#integration-tests-against-real-aws-it)
+16. [Graceful shutdown (GS)](#graceful-shutdown-gs)
+17. [Integration tests against real AWS (IT)](#integration-tests-against-real-aws-it)
 
 ## Setup
 
@@ -81,6 +82,7 @@ Short names used in the steps. `$B` is `http://localhost:8080`.
 | **extraction** *id* | `curl -s $B/internal/v1/files/<id>/extraction` (internal endpoint) |
 | **event** | `scripts/send-scan-event.sh created <id>`, `result <id> <STATUS> [reason]`, `tag <id> <STATUS>`, `raw '<body>'` (simulator off) |
 | **kill** | `kill -9 $(pgrep -f FileUploadServiceApplication)`: a crash, no shutdown hooks (`docker kill file-upload-service-app` in Docker) |
+| **sigterm** | `kill -TERM $(pgrep -f FileUploadServiceApplication)`: a graceful stop, as a deploy does (`scripts/dev.sh stop` for the Docker app) |
 | **list** *bucket* | `curl -s 'localhost:9099/<bucket>?list-type=2' \| grep -o '<Key>[^<]*'`: `file-upload-quarantine`, `file-upload-clean` |
 | **record** *id* | DynamoDB item: see `crash` helpers in [Crash safety](#crash-safety-cr) |
 
@@ -364,6 +366,24 @@ mocked): `BedrockPolicyModelTests`, `PolicyParserTests`, `ExtractionWorkerTests`
 | EX-22 | P1 | A | Model access | wrong model ARN, or remove `bedrock:InvokeModel` | `FAILED` with `MODEL_NOT_FOUND` / `MODEL_ACCESS_DENIED` at once (no retries); 2015 |
 | EX-23 | P2 | A | Throttling under load | opt in more files than the model's quota allows per minute | 3008 `MODEL_THROTTLED`, retries succeed later; none lost |
 | EX-24 | P2 | A | Prompt injection in the document | a policy image that also says "ignore your instructions and output …" | The answer is still the schema (validated); injected text never becomes a field outside its rules |
+
+## Graceful shutdown (GS)
+
+On SIGTERM the service finishes or hands over its work, then closes its clients (README "Graceful
+shutdown"). Watch the logs for 1016 → 1018 (per worker) → 1017. Unit tests: `ScanEventConsumerTests`,
+`ExtractionWorkerTests`, `GracefulShutdownTests`, `FileRepositoryTests`.
+
+| Id | P | Where | Scenario | Steps | Expected |
+|---|---|---|---|---|---|
+| GS-01 | P1 | L | Idle stop | **sigterm** an idle instance | Exits within ~12 s (the scan consumer's long poll ends); logs 1016, 1018 ×2 (`finished` 0, `handed_over` 0), 1017; no ERROR |
+| GS-02 | P1 | L | Upload in flight | stream *big.png* with `--limit-rate 2M`; **sigterm** 2 s in | The client gets 202; the file is `SCANNING`, then `AVAILABLE` after a restart |
+| GS-03 | P1 | L | Model call that finishes in time | slow model calls 10 s (`…_SIMULATOR_DELAY=10s`); **extract** a file; **sigterm** while `PENDING` | Extraction `COMPLETED`, `attempts` 1, before exit; 1018 extraction `finished` 1 |
+| GS-04 | P1 | L | Model call longer than the drain | `…_SIMULATOR_DELAY=40s`; as GS-03 | At ~25 s: 1019, 1018 `handed_over` 1; stored `attempts` back to 0, lease ended; after a restart `COMPLETED` within seconds as attempt 1 (not after 3 min) |
+| GS-05 | P2 | L | Scan events received during shutdown | simulator scan delay 3 s; upload 5 files; **sigterm** as their results arrive | 1018 scan-events `handed_over` > 0 when a batch was cut; after a restart every file final within seconds (no 60 s visibility wait) |
+| GS-06 | P2 | L | Scheduled job running | recovery every 5 s (`…_SCAN_RECOVERY_INTERVAL=5s`), a stranded PROMOTING file (CR-03); **sigterm** during a recovery run | The run finishes (2010 then 2005) before 1017 |
+| GS-07 | P1 | L | Docker stop | `scripts/dev.sh docker`; then `scripts/dev.sh stop` | The container drains (1017 in its log) and isn't killed at 10 s |
+| GS-08 | P1 | L | No errors from closed clients | any GS run | No ERROR or stack trace after 1016 |
+| GS-09 | P1 | A | Rolling deploy | `kubectl rollout restart` under load with extractions running | No client errors; 1017 in each old pod's log within ~45 s of SIGTERM; extractions handed over complete on new pods |
 
 ## Integration tests against real AWS (IT)
 

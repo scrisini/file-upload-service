@@ -317,7 +317,8 @@ cmd_status() {
 # `docker compose run`, so it's stopped by name (and removes itself)
 stop_app_container() {
     if docker ps -q --filter "name=^${APP_CONTAINER}\$" | grep -q .; then
-        docker stop "$APP_CONTAINER" >/dev/null
+        # SIGTERM, and time to drain (README "Graceful shutdown"); Docker's default is 10 s
+        docker stop --time 45 "$APP_CONTAINER" >/dev/null
         ok "stopped the app container $APP_CONTAINER"
     fi
 }
