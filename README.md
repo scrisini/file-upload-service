@@ -614,6 +614,10 @@ scripts/try-upload.sh stream report.pdf      # then open Jaeger, service file-up
 curl -s localhost:8080/actuator/metrics/file-upload-service.upload.stream    # the same call as a timer
 ```
 
+`scripts/check-tracing.sh` checks all of it in one go: it streams a file with a `traceparent` header it
+chose, reads the three timers from `/actuator/metrics` and `/actuator/prometheus`, then fetches that
+trace from Jaeger by id and looks for the three spans (exit 0 passed, 1 failed, 2 Jaeger not running).
+
 Started in the IDE instead, add `FILE_UPLOAD_SERVICE_TRACING_SAMPLING=1.0` and
 `FILE_UPLOAD_SERVICE_TRACING_EXPORT=true` to the run configuration. `scripts/dev.sh stop` stops Jaeger
 with the other containers; its traces are kept in memory only.
