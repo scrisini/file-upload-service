@@ -20,6 +20,7 @@
 set -euo pipefail
 
 PORT_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build/dev-port"
+PORT_FILE=8080
 default_port="${SERVER_PORT:-$( [ -f "$PORT_FILE" ] && cat "$PORT_FILE" || echo 8080)}"
 BASE="${FILE_UPLOAD_SERVICE_URL:-http://localhost:$default_port}"
 
@@ -43,6 +44,24 @@ style="$1" file="$2"
 type="${3:-$(file --brief --mime-type "$file")}"
 size="$(wc -c < "$file" | tr -d ' ')"
 name="$(basename "$file")"
+# The name travels in a query string (stream) and a JSON string (presigned), so a name with spaces,
+# quotes or non-ASCII characters has to be encoded for each. Byte by byte, bash 3.2 compatible.
+urlencode() {
+    local s="$1" out="" c i
+    local LC_ALL=C
+    for ((i = 0; i < ${#s}; i++)); do
+        c="${s:i:1}"
+        case "$c" in
+            [a-zA-Z0-9._~-]) out+="$c" ;;
+            *) out+="$(printf '%%%02X' $(($(printf '%d' "'$c") & 255)))" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+json_escape() {
+    local s="${1//\\/\\\\}"
+    printf '%s' "${s//\"/\\\"}"
+}
 if [ -z "${IDEMPOTENCY_KEY+set}" ]; then
     IDEMPOTENCY_KEY="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 fi
@@ -66,7 +85,7 @@ case "$style" in
         printf '==> POST /api/v1/uploads (%s, %s bytes)\n' "$type" "$size"
         response="$(curl -sS -D "$headers" -X POST "$BASE/api/v1/uploads" -H 'Content-Type: application/json' \
             "${key_header[@]}" \
-            -d "{\"fileName\":\"$name\",\"contentType\":\"$type\",\"size\":$size$extract_json}")"
+            -d "{\"fileName\":\"$(json_escape "$name")\",\"contentType\":\"$type\",\"size\":$size$extract_json}")"
         printf '%s' "$response" | show
         replayed
         id="$(field "$response" id)"
@@ -81,7 +100,7 @@ case "$style" in
         ;;
     stream)
         printf '==> POST /api/v1/files (%s, %s bytes, through the service)\n' "$type" "$size"
-        response="$(curl -sS -D "$headers" -X POST "$BASE/api/v1/files?fileName=$name$extract_query" -H "Content-Type: $type" \
+        response="$(curl -sS -D "$headers" -X POST "$BASE/api/v1/files?fileName=$(urlencode "$name")$extract_query" -H "Content-Type: $type" \
             "${key_header[@]}" --data-binary "@$file")"
         printf '%s' "$response" | show
         replayed

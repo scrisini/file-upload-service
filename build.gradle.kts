@@ -34,6 +34,12 @@ dependencies {
     // OpenAPI spec and Swagger UI (not in Spring Boot's BOM; 3.2.0 is built against Boot 4.1.2)
     implementation("org.springdoc:springdoc-openapi-starter-webmvc-ui:3.2.0")
 
+    // Observability: @Observed needs AspectJ's runtime; traces go out over OTLP (README "Tracing")
+    implementation("org.springframework.boot:spring-boot-starter-aspectj")
+    implementation("org.springframework.boot:spring-boot-starter-opentelemetry")
+    // Prometheus scrape endpoint, /actuator/prometheus (README "Metrics"); version from the Boot BOM
+    implementation("io.micrometer:micrometer-registry-prometheus")
+
     compileOnly("org.projectlombok:lombok")
     annotationProcessor("org.projectlombok:lombok")
     annotationProcessor("org.springframework.boot:spring-boot-configuration-processor")

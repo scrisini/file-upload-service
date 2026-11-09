@@ -48,7 +48,8 @@ flowchart LR
 - **Production mode** (`FILE_UPLOAD_SERVICE_MODE=production`, set in `deploy/`) refuses to start with
   settings that are unsafe in production (README "Production mode").
 - **Only the ALB is public**, and it routes only `/api/`. `/actuator` (health details, metrics,
-  `configcheck`) is reachable only inside the VPC.
+  `prometheus`, `configcheck`) is reachable only inside the VPC. Prometheus scrapes each pod
+  directly on its port, not through the ALB.
 
 ## What survives what
 

@@ -7,6 +7,9 @@
 #   scripts/dev.sh run [args...]    check, start dependencies, then run the app in the foreground
 #   scripts/dev.sh docker [args...] the same, with the app in Docker: builds its image (as production
 #                                   does) and runs it with a read-only filesystem
+#   scripts/dev.sh tracing          start Jaeger, to see traces at http://localhost:16686 (README "Tracing")
+#   scripts/dev.sh idea [--force]   write the IntelliJ IDEA run configuration for debugging against the local
+#                                   emulators and simulators (README "Debugging from the IDE")
 #   scripts/dev.sh status           show dependency and app health
 #   scripts/dev.sh test             run the test suite
 #   scripts/dev.sh stop             stop dependencies, keeping their data
@@ -222,6 +225,77 @@ use_local_aws() {
     ok "AWS services: local emulators; GuardDuty: simulated (EICAR test string = infected); Bedrock: simulated"
 }
 
+# Jaeger (docker-compose.yml profile "tracing"): receives the app's traces over OTLP, shows them in a UI
+cmd_tracing() {
+    has_compose || die "docker-compose.yml is missing"
+    step "Starting Jaeger"
+    docker compose --profile tracing up -d --wait jaeger
+    ok "Jaeger UI http://localhost:16686; the app exports traces to it when started with 'run'"
+}
+
+# Traces: every request is sampled on a laptop, and exported when Jaeger is listening for them
+use_local_tracing() {
+    export FILE_UPLOAD_SERVICE_TRACING_SAMPLING="${FILE_UPLOAD_SERVICE_TRACING_SAMPLING:-1.0}"
+    if [ -z "${FILE_UPLOAD_SERVICE_TRACING_EXPORT:-}" ]; then
+        if curl -s -o /dev/null --max-time 2 -X POST -H 'Content-Type: application/json' -d '{}' \
+            http://localhost:4318/v1/traces; then
+            export FILE_UPLOAD_SERVICE_TRACING_EXPORT=true
+            ok "Traces: exported to Jaeger, http://localhost:16686"
+        else
+            ok "Traces: not exported (start Jaeger with 'scripts/dev.sh tracing'); trace ids are still in the logs"
+        fi
+    fi
+}
+
+# The settings `run` gives the app, as an IntelliJ IDEA "Application" run configuration, so a
+# developer can debug from the IDE with the same emulators and simulators. The file is in .idea/
+# (git-ignored): each developer creates their own.
+IDEA_CONFIG=".idea/runConfigurations/file_upload_service_local.xml"
+IDEA_MODULE="file-upload-service.main"
+
+cmd_idea() {
+    local force=false
+    case "${1:-}" in
+        "") ;;
+        --force) force=true ;;
+        *) die "usage: scripts/dev.sh idea [--force]" ;;
+    esac
+    if [ -f "$IDEA_CONFIG" ] && [ "$force" = false ]; then
+        die "$IDEA_CONFIG exists; 'scripts/dev.sh idea --force' replaces it"
+    fi
+    local names=(FILE_UPLOAD_SERVICE_AWS_REGION FILE_UPLOAD_SERVICE_S3_ENDPOINT FILE_UPLOAD_SERVICE_SQS_ENDPOINT
+        FILE_UPLOAD_SERVICE_DYNAMODB_ENDPOINT FILE_UPLOAD_SERVICE_SCAN_QUEUE_URL FILE_UPLOAD_SERVICE_SCAN_SIMULATOR
+        FILE_UPLOAD_SERVICE_EXTRACTION_MODEL_ID FILE_UPLOAD_SERVICE_EXTRACTION_SIMULATOR
+        FILE_UPLOAD_SERVICE_TRACING_SAMPLING FILE_UPLOAD_SERVICE_TRACING_EXPORT AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY)
+    local name
+    # the defaults `run` uses, not whatever this shell happens to have set
+    for name in "${names[@]}"; do unset "$name"; done
+    use_local_aws
+    export FILE_UPLOAD_SERVICE_TRACING_SAMPLING=1.0
+    export FILE_UPLOAD_SERVICE_TRACING_EXPORT=true
+    mkdir -p "$(dirname "$IDEA_CONFIG")"
+    {
+        echo '<component name="ProjectRunConfigurationManager">'
+        echo '  <configuration default="false" name="file-upload-service (local)" type="Application" factoryName="Application">'
+        echo '    <option name="MAIN_CLASS_NAME" value="com.crisinis.fileuploadservice.FileUploadServiceApplication" />'
+        echo "    <module name=\"$IDEA_MODULE\" />"
+        echo '    <option name="PROGRAM_PARAMETERS" value="--file-upload-service.instance=ide" />'
+        echo '    <envs>'
+        for name in "${names[@]}"; do
+            echo "      <env name=\"$name\" value=\"${!name}\" />"
+        done
+        echo '    </envs>'
+        echo '    <method v="2" />'
+        echo '  </configuration>'
+        echo '</component>'
+    } > "$IDEA_CONFIG"
+    ok "wrote $IDEA_CONFIG: run 'file-upload-service (local)' from IDEA's run dropdown (reload the project if it isn't listed)"
+    if ! grep -qs "$IDEA_MODULE" .idea/modules.xml; then
+        warn "module $IDEA_MODULE isn't in .idea/modules.xml: open the project in IDEA as a Gradle project first, then run this again with --force"
+    fi
+    ok "start the dependencies first: scripts/dev.sh infra (and 'scripts/dev.sh tracing' for Jaeger)"
+}
+
 # A port number a user may pick: 1024-65535
 valid_port() {
     case "$1" in
@@ -266,6 +340,7 @@ cmd_run() {
     cmd_infra
     choose_app_port
     use_local_aws
+    use_local_tracing
     step "Starting file-upload-service on http://localhost:$APP_PORT (Ctrl-C to stop)"
     local app=(./gradlew bootRun --console=plain)
     if [ "$#" -gt 0 ]; then
@@ -327,7 +402,7 @@ cmd_stop() {
     has_compose || { step "No docker-compose.yml; nothing to stop"; return; }
     step "Stopping the app container, if any, and dependencies (data is kept)"
     stop_app_container
-    docker compose --profile app stop
+    docker compose --profile app --profile tracing stop
 }
 
 cmd_reset() {
@@ -370,6 +445,8 @@ case "$command" in
     infra)  cmd_infra ;;
     run)    cmd_run "$@" ;;
     docker) cmd_docker "$@" ;;
+    tracing) cmd_tracing ;;
+    idea)   cmd_idea "$@" ;;
     status) cmd_status ;;
     stop)   cmd_stop ;;
     reset)  cmd_reset "$@" ;;

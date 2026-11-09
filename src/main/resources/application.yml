@@ -150,7 +150,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics,configcheck
+        include: health,info,metrics,configcheck,prometheus
   endpoint:
     health:
       show-details: always
@@ -161,6 +161,30 @@ management:
   info:
     env:
       enabled: true
+  # @Observed on a method (README "Tracing"): one observation gives a timer (metrics) and a span (traces)
+  observations:
+    annotations:
+      enabled: true
+  tracing:
+    sampling:
+      # share of requests traced; 1.0 on a laptop (scripts/dev.sh run), a fraction when deployed
+      probability: ${FILE_UPLOAD_SERVICE_TRACING_SAMPLING:0.1}
+    export:
+      otlp:
+        # spans leave the service only when this is on; trace ids reach the logs either way
+        enabled: ${FILE_UPLOAD_SERVICE_TRACING_EXPORT:false}
+  opentelemetry:
+    tracing:
+      export:
+        otlp:
+          # an OpenTelemetry collector or Jaeger on the private network (not through the outbound proxy)
+          endpoint: ${FILE_UPLOAD_SERVICE_TRACING_ENDPOINT:http://localhost:4318/v1/traces}
+          transport: http
+  otlp:
+    metrics:
+      export:
+        # metrics are scraped, not pushed; the starter would otherwise push them to localhost:4318
+        enabled: false
   metrics:
     tags:
       application: file-upload-service
@@ -188,4 +212,4 @@ logging:
         environment: ${FILE_UPLOAD_SERVICE_ENVIRONMENT:local}
   pattern:
     # Text format: the request id after the logger, catalogued details as key="value"
-    console: "%d{HH:mm:ss.SSS} %5p [%t] %logger{36} %X{http.request.id} - %m %kvp%n%ex"
+    console: "%d{HH:mm:ss.SSS} %5p [%t] %logger{36} %X{http.request.id} %X{traceId:-} - %m %kvp%n%ex"

@@ -38,7 +38,8 @@ explains it. Keep it current: add a row in the same pull request as the feature.
 | Outbound proxy | Every connection to an external host through `{E}_PROXY_HOST` when it's set, failing closed | [Outbound proxy](#outbound-proxy) |
 | **Operations** | | |
 | Coded logs and runbook | Every operational log line has a stable code (`{E}-nnnn`) with a procedure in the runbook; ECS JSON logs; a request id on every response | [Logging and support](#logging-and-support) |
-| Metrics and health | Micrometer meters (tagged `mode`), health per dependency, liveness and readiness probes | [Metrics](#metrics) |
+| Metrics and health | Micrometer meters (tagged `mode`), a Prometheus scrape endpoint, health per dependency, liveness and readiness probes | [Metrics](#metrics) |
+| Tracing | `@Observed` on the streamed-upload flow gives each call a timer and a span; spans go to an OpenTelemetry collector or Jaeger (`FILE_UPLOAD_SERVICE_TRACING_EXPORT`); trace ids are in the logs | [Tracing](#tracing) |
 | Capacity | Measured cost per unit of work and a rule for how many instances and cores a load needs | [Capacity](#capacity) |
 | AWS deployment | EKS behind an ALB, timeouts aligned to the web server, graceful shutdown | [`docs/deployment.md`](docs/deployment.md) |
 | **Engineering** | | |
@@ -124,6 +125,67 @@ a few minutes; later ones take under a minute.
 ./gradlew bootJar && java -jar build/libs/file-upload-service-0.0.1-SNAPSHOT.jar
 ```
 
+### Debugging from the IDE
+
+To set breakpoints, run the app from the IDE's debugger instead of `scripts/dev.sh run`. The
+dependencies and the simulators are the same; only the process that starts the app changes, so you
+must give the IDE what `dev.sh run` would have exported.
+
+1. **Start the dependencies** (S3Mock, ElasticMQ, DynamoDB Local, with the table created):
+   ```bash
+   scripts/dev.sh infra
+   ```
+2. **Create the run configuration.** In IntelliJ IDEA, one command writes it:
+   ```bash
+   scripts/dev.sh idea            # --force replaces an existing one
+   ```
+   It creates `.idea/runConfigurations/file_upload_service_local.xml` (git-ignored, so each
+   developer makes their own) with everything below, and `file-upload-service (local)` appears in
+   the run dropdown (reload the Gradle project if it doesn't). It takes the values `scripts/dev.sh run`
+   uses, so the two never drift. For another IDE, or by hand (*Run → Edit Configurations → + →
+   Application*), use main class `com.crisinis.fileuploadservice.FileUploadServiceApplication`,
+   the project's JDK 25, and these **environment variables**:
+
+   | Variable | Value | Why |
+   |---|---|---|
+   | `FILE_UPLOAD_SERVICE_AWS_REGION` | `us-east-1` | Any region; the emulators ignore it |
+   | `FILE_UPLOAD_SERVICE_S3_ENDPOINT` | `http://localhost:9099` | S3Mock |
+   | `FILE_UPLOAD_SERVICE_SQS_ENDPOINT` | `http://localhost:9324` | ElasticMQ |
+   | `FILE_UPLOAD_SERVICE_DYNAMODB_ENDPOINT` | `http://localhost:8000` | DynamoDB Local |
+   | `FILE_UPLOAD_SERVICE_SCAN_QUEUE_URL` | `http://localhost:9324/000000000000/file-upload-scan-events` | Without a queue the app starts but never sees scan results (log [1011](docs/runbook.md#file_upload_service-1011)) |
+   | `FILE_UPLOAD_SERVICE_SCAN_SIMULATOR` | `true` | The [GuardDuty simulator](#quick-start) |
+   | `FILE_UPLOAD_SERVICE_EXTRACTION_MODEL_ID` | `simulated-insurance-policy-model` | Policy extraction against the Bedrock simulator |
+   | `FILE_UPLOAD_SERVICE_EXTRACTION_SIMULATOR` | `true` | Without it, a real model id would call Bedrock with your own credentials |
+   | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `local` / `local` | The emulators accept anything; this stops the SDK looking for real credentials |
+
+   Leave `AWS_SESSION_TOKEN` and `AWS_PROFILE` unset, and don't set `FILE_UPLOAD_SERVICE_MODE=production`
+   (production mode refuses the simulators).
+3. **Debug** the configuration (the bug icon). Breakpoints work in the controllers, services and in
+   the simulators themselves (`events/`), since they run inside the app.
+4. **Drive it** from a terminal, as with `dev.sh run`:
+   ```bash
+   scripts/try-upload.sh stream report.pdf
+   scripts/try-upload.sh presigned photo.jpg
+   ```
+   If the IDE app isn't on 8080, `export SERVER_PORT=<port>` first; `try-upload.sh` reads it.
+
+Things to know while stopped at a breakpoint:
+
+- The simulator sends its scan result after `FILE_UPLOAD_SERVICE_SCAN_SIMULATOR_DELAY` (3 s), and SQS
+  redelivers a message that isn't deleted after its visibility timeout, so a long pause may produce
+  a duplicate event. That exercises redelivery but may surprise you. Raise the delay (for example
+  `FILE_UPLOAD_SERVICE_SCAN_SIMULATOR_DELAY=30s`) to step through the upload before the result arrives.
+- To step through an event yourself, set `FILE_UPLOAD_SERVICE_SCAN_SIMULATOR=false` and inject
+  events with `scripts/send-scan-event.sh` (unscannable results, duplicates, reordering).
+- To debug a copy started from a terminal instead, run `./gradlew bootRun --debug-jvm` (after
+  `scripts/dev.sh infra` and exporting the variables above): it waits for a debugger on port 5005; attach with a *Remote JVM Debug*
+  configuration.
+- How the IDE's stop button ends the process (a signal, or a hard kill) depends on the IDE and its
+  settings. To test the [graceful shutdown](#graceful-shutdown) drain, send SIGTERM yourself
+  (`kill -TERM <pid>`); for a [crash](#crash-safety), `kill -9 <pid>`.
+- If a developer's IDE copy and `dev.sh run` are both started, the second asks for another port.
+  Never kill by class name; stop the IDE one from the IDE.
+
 ### Troubleshooting
 
 - **`port 8080 is in use`**: another copy may be running (for example from your IDE, or the
@@ -151,6 +213,7 @@ a few minutes; later ones take under a minute.
 | GET | `/v3/api-docs`, `/swagger-ui.html` | The OpenAPI description and Swagger UI ([API documentation](#api-documentation)); not in production |
 | GET | `/actuator/health` | Health, including `s3`, `dynamoDb` and `scanQueue` (not part of readiness) |
 | GET | `/actuator/metrics` | Micrometer meters |
+| GET | `/actuator/prometheus` | The same meters in Prometheus text format, for scraping (inside the VPC only; see [Metrics](#metrics)) |
 
 | Status | Meaning |
 |---|---|
@@ -296,6 +359,9 @@ so a caller can quote it to support.
 | `file-upload-service.extraction.max-attempts` / `.retry-backoff` | `…_EXTRACTION_MAX_ATTEMPTS` / `_RETRY_BACKOFF` | `3` / `30s` (× attempt) |
 | `file-upload-service.extraction.lease` | `FILE_UPLOAD_SERVICE_EXTRACTION_LEASE` | `3m`: a dead worker's file is taken over after this; ≥ timeout + 10 s |
 | `file-upload-service.extraction.poll-interval` / `.concurrency` | `…_EXTRACTION_POLL_INTERVAL` / `_CONCURRENCY` | `2s` / `4` model calls per instance |
+| `management.tracing.sampling.probability` | `FILE_UPLOAD_SERVICE_TRACING_SAMPLING` | `0.1` (`1.0` with `scripts/dev.sh run`): share of requests traced |
+| `management.tracing.export.otlp.enabled` | `FILE_UPLOAD_SERVICE_TRACING_EXPORT` | `false`; `true` sends spans to the endpoint below (`scripts/dev.sh run` turns it on when Jaeger is up) |
+| `management.opentelemetry.tracing.export.otlp.endpoint` | `FILE_UPLOAD_SERVICE_TRACING_ENDPOINT` | `http://localhost:4318/v1/traces`; an OpenTelemetry collector on the private network, not through the outbound proxy |
 | `file-upload-service.extraction.simulator.enabled` / `.delay` | `FILE_UPLOAD_SERVICE_EXTRACTION_SIMULATOR` / `_DELAY` | `false` / `1s`; local only, refused in production |
 | `file-upload-service.aws.bedrock-endpoint` | `FILE_UPLOAD_SERVICE_BEDROCK_ENDPOINT` | blank = AWS (a VPC endpoint URL if DNS doesn't resolve it) |
 | `file-upload-service.scan.simulator.enabled` / `.delay` | `FILE_UPLOAD_SERVICE_SCAN_SIMULATOR` / `_DELAY` | `false` / `3s`; local only, refused in production |
@@ -464,12 +530,99 @@ Logs are built for production support and log processors (ELK, Splunk, New Relic
 | `file-upload-service.extraction.time-to-complete` | timer, p50/p95/p99 | from the file becoming available to its policy being stored |
 | `file-upload-service.extraction.tokens` | counter | `direction` (`input`, `output`): Bedrock tokens (cost) |
 | `file-upload-service.recovery` | counter | `action` (`promotion_resumed`, `result_from_tag`): files [crash recovery](#crash-safety) finished |
+| `file-upload-service.upload.presigned` | timer (`@Observed`) | `method`, `class`, `error`: a presigned-URL request (creating the record and signing the URL, not the client's PUT); see [Tracing](#tracing) |
+| `file-upload-service.upload.stream` | timer (`@Observed`) | `method`, `class`, `error`: a streamed upload, end to end; see [Tracing](#tracing) |
+| `file-upload-service.file.create` | timer (`@Observed`) | `class`, `method`, `error`: creating the file's record in DynamoDB |
+| `file-upload-service.quarantine.store` | timer (`@Observed`) | `class`, `method`, `error`: streaming the bytes to quarantine |
 | `file-upload-service.aws.requests` | timer, p50/p95/p99 | `service`, `operation`, `outcome`: every AWS call with its retries; SQS `ReceiveMessage` includes its long-poll wait |
+
+**Prometheus** scrapes `GET /actuator/prometheus` (names become `file_upload_service_upload_stream_seconds_count`,
+and so on; p50/p95/p99 are exported as quantiles). It is on the same port as the API, so it is
+reachable only inside the VPC: the ALB routes only `/api/` ([docs/deployment.md](docs/deployment.md)).
+Point the scrape job at the pods (Kubernetes pod discovery or a `ServiceMonitor`) rather than at the
+load balancer, so each instance is scraped. Locally: `curl localhost:8080/actuator/prometheus`.
 
 Every meter is also tagged `mode`. Work that passes through a queue or an asynchronous stage
 (messages, streams, scheduled batches) gets two timers: from receipt to where it leaves (what a
 caller experiences), and the time it waited inside (which grows when the service falls behind).
 Stamp the work with `System.nanoTime()` when it arrives, and add both timers to this table.
+
+## Tracing
+
+One annotation, `@Observed`, gives a method a **metric** (a timer) and a **trace span**: Micrometer's
+Observation API records the call once, and a handler for each signal reads it. Three methods on the
+streamed-upload flow carry it, so a team can see the idea on one flow:
+
+```java
+@Observed(name = "file-upload-service.upload.stream",        // the timer's name
+          contextualName = "upload-service#stream",           // the span's name in the trace view
+          lowCardinalityKeyValues = {"method", "stream"})     // extra tags: few values only
+public UploadResult stream(DeclaredFile declared, InputStream body, Optional<IdempotencyKey> key) { ... }
+```
+
+| Annotated method | Observation (timer) | Span |
+|---|---|---|
+| `UploadService.requestUpload` | `file-upload-service.upload.presigned` | `upload-service#presigned` |
+| `UploadService.stream` | `file-upload-service.upload.stream` | `upload-service#stream` |
+| `FileRepository.createIfAbsent` | `file-upload-service.file.create` | `file-repository#createIfAbsent` |
+| `FileStorage.store` | `file-upload-service.quarantine.store` | `file-storage#store` |
+
+A streamed upload then reads as one trace, with Spring's own span for the HTTP request at the top:
+
+```
+http post /api/v1/files           260 ms
+  upload-service#stream           228 ms
+    file-repository#createIfAbsent 77 ms
+    file-storage#store            110 ms
+```
+
+(Measured once on a laptop against the emulators; the numbers only show the shape.)
+
+**How it's wired** (Spring Boot 4.1; the same as 4.0):
+
+- `spring-boot-starter-aspectj` supplies AspectJ's runtime and `spring-boot-starter-opentelemetry`
+  the OpenTelemetry bridge and OTLP exporter. Both are in `build.gradle.kts`.
+- `management.observations.annotations.enabled=true` registers the `ObservedAspect` that reads the
+  annotation. The aspect is a Spring proxy, so it sees only calls **from another bean** to a
+  **public** method: `@Observed` on a `private` method, or on one called through `this`, does nothing.
+- Spans leave the service over OTLP/HTTP when `FILE_UPLOAD_SERVICE_TRACING_EXPORT=true`, to
+  `FILE_UPLOAD_SERVICE_TRACING_ENDPOINT`. The collector is an internal dependency on the private
+  network, so the [outbound proxy](#outbound-proxy) does not apply. Metrics are not pushed over OTLP
+  (`management.otlp.metrics.export.enabled=false`): they are scraped, as before.
+- Trace ids are in the logs whether or not spans are exported: the text format shows `traceId` after
+  the request id, and the ECS JSON format carries `trace.id` and `span.id`. Search the logs by it to
+  find every line of one request.
+- A call that throws is recorded as an error on the span and tagged `error` on the timer (`none` on success, the exception's class name otherwise). Here
+  `FileStorage.store` throwing `ObjectExistsException` is an idempotent replay, not a failure, so a
+  replay shows as an error span.
+
+**Rules for adding `@Observed`:**
+
+- Name the observation `file-upload-service.<area>.<thing>` and keep the tag keys the same
+  ([Metrics](#metrics)). Tag values must be few (a method, an outcome), **never a file id, file name
+  or any personal data**: a tag with many values creates a meter for each. Put identifiers in logs.
+- Annotate a method that is one meaningful step of a flow, not every method. Each annotated call costs
+  a timer lookup and, when sampled, a span, so keep it off per-event hot paths without a measurement.
+- Use `@Observed` for a method's whole duration. To time part of a method, or to add an event, use the
+  `Observation` API (`Observation.createNotStarted(...)`) instead.
+- A new observation goes in the Metrics table above and, if a person must act on it, the runbook.
+
+**Seeing it locally:**
+
+```bash
+scripts/dev.sh tracing                       # starts Jaeger (UI http://localhost:16686, OTLP on :4318)
+scripts/dev.sh run                           # samples every request, and exports because Jaeger is up
+scripts/try-upload.sh stream report.pdf      # then open Jaeger, service file-upload-service
+curl -s localhost:8080/actuator/metrics/file-upload-service.upload.stream    # the same call as a timer
+```
+
+`scripts/check-tracing.sh` checks all of it in one go: it streams a file with a `traceparent` header it
+chose, reads the three timers from `/actuator/metrics` and `/actuator/prometheus`, then fetches that
+trace from Jaeger by id and looks for the three spans (exit 0 passed, 1 failed, 2 Jaeger not running).
+
+Started in the IDE instead, add `FILE_UPLOAD_SERVICE_TRACING_SAMPLING=1.0` and
+`FILE_UPLOAD_SERVICE_TRACING_EXPORT=true` to the run configuration. `scripts/dev.sh stop` stops Jaeger
+with the other containers; its traces are kept in memory only.
 
 ## File lifecycle
 
