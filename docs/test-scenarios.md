@@ -142,6 +142,7 @@ Unit tests: `UploadServiceTests`, `FileControllerTests`.
 | ST-10 | P2 | L | Body shorter than Content-Length | send a `Content-Length` larger than the body (e.g. a small script with a raw socket, or abort curl partway with `--max-time`) | 400 `INCOMPLETE` (or the connection closes); no object in quarantine |
 | ST-11 | P1 | L | Capacity | `FILE_UPLOAD_SERVICE_MAX_CONCURRENT_STREAMS=1`; start a slow stream (`curl --limit-rate 100K` of *big.png*); stream another | Second: **503**, `Retry-After: 1`. Gauge `uploads.streaming` 1 while the first runs, 0 after |
 | ST-12 | P2 | L | Large file | stream *big.png* | 202 in well under a second locally; heap stays flat (NF-02) |
+| ST-14 | P2 | L | File name with spaces | `scripts/try-upload.sh stream "my scan (1).png"` (the script encodes the name); or `curl` with `?fileName=my%20scan%20(1).png` | 202; `file.fileName` is `my scan (1).png`; after `AVAILABLE`, the download link's `Content-Disposition` is `filename*=UTF-8''my%20scan%20%281%29.png`. Same name through ask-url (PS-17) is kept as is |
 | ST-13 | P3 | L | No `fileName` | stream without `?fileName=` | Stored as `upload` |
 
 ## File types and content checks (FT)

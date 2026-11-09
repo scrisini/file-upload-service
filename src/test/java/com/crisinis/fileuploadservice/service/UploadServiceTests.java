@@ -238,6 +238,8 @@ class UploadServiceTests {
     void keepsOnlyTheFileNamePart() {
         assertThat(UploadService.cleanName("C:\\Users\\me\\scan.pdf")).isEqualTo("scan.pdf");
         assertThat(UploadService.cleanName("a/b/c.png")).isEqualTo("c.png");
+        assertThat(UploadService.cleanName("my scan  (1).png")).isEqualTo("my scan  (1).png");
+        assertThat(UploadService.cleanName("  padded name.png ")).isEqualTo("padded name.png");
         assertThat(UploadService.cleanName("bad\u0000name\n.png")).isEqualTo("badname.png");
         assertThat(UploadService.cleanName("..")).isEqualTo("upload");
         assertThat(UploadService.cleanName(null)).isEqualTo("upload");
