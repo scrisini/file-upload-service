@@ -530,10 +530,10 @@ Logs are built for production support and log processors (ELK, Splunk, New Relic
 | `file-upload-service.extraction.time-to-complete` | timer, p50/p95/p99 | from the file becoming available to its policy being stored |
 | `file-upload-service.extraction.tokens` | counter | `direction` (`input`, `output`): Bedrock tokens (cost) |
 | `file-upload-service.recovery` | counter | `action` (`promotion_resumed`, `result_from_tag`): files [crash recovery](#crash-safety) finished |
-| `file-upload-service.upload.presigned` | timer (`@Observed`) | `method`, `class`, `exception`: a presigned-URL request (creating the record and signing the URL, not the client's PUT); see [Tracing](#tracing) |
-| `file-upload-service.upload.stream` | timer (`@Observed`) | `method`, `class`, `exception`: a streamed upload, end to end; see [Tracing](#tracing) |
-| `file-upload-service.file.create` | timer (`@Observed`) | `class`, `method`, `exception`: creating the file's record in DynamoDB |
-| `file-upload-service.quarantine.store` | timer (`@Observed`) | `class`, `method`, `exception`: streaming the bytes to quarantine |
+| `file-upload-service.upload.presigned` | timer (`@Observed`) | `method`, `class`, `error`: a presigned-URL request (creating the record and signing the URL, not the client's PUT); see [Tracing](#tracing) |
+| `file-upload-service.upload.stream` | timer (`@Observed`) | `method`, `class`, `error`: a streamed upload, end to end; see [Tracing](#tracing) |
+| `file-upload-service.file.create` | timer (`@Observed`) | `class`, `method`, `error`: creating the file's record in DynamoDB |
+| `file-upload-service.quarantine.store` | timer (`@Observed`) | `class`, `method`, `error`: streaming the bytes to quarantine |
 | `file-upload-service.aws.requests` | timer, p50/p95/p99 | `service`, `operation`, `outcome`: every AWS call with its retries; SQS `ReceiveMessage` includes its long-poll wait |
 
 **Prometheus** scrapes `GET /actuator/prometheus` (names become `file_upload_service_upload_stream_seconds_count`,
@@ -592,7 +592,7 @@ http post /api/v1/files           260 ms
 - Trace ids are in the logs whether or not spans are exported: the text format shows `traceId` after
   the request id, and the ECS JSON format carries `trace.id` and `span.id`. Search the logs by it to
   find every line of one request.
-- A call that throws is recorded as an error on the span and tagged `exception` on the timer. Here
+- A call that throws is recorded as an error on the span and tagged `error` on the timer (`none` on success, the exception's class name otherwise). Here
   `FileStorage.store` throwing `ObjectExistsException` is an idempotent replay, not a failure, so a
   replay shows as an error span.
 
