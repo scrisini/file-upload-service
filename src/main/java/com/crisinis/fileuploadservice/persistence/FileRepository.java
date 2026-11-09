@@ -18,6 +18,7 @@ import com.crisinis.fileuploadservice.model.FileType;
 import com.crisinis.fileuploadservice.model.ScanResult;
 import com.crisinis.fileuploadservice.model.UploadMethod;
 import com.crisinis.fileuploadservice.service.DependencyUnavailableException;
+import io.micrometer.observation.annotation.Observed;
 import org.springframework.stereotype.Repository;
 import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
@@ -106,6 +107,7 @@ public class FileRepository {
      *
      * @return changed when this call created the record
      */
+    @Observed(name = "file-upload-service.file.create", contextualName = "file-repository#createIfAbsent")
     public Update createIfAbsent(FileRecord file) {
         Map<String, AttributeValue> item = new HashMap<>();
         item.put("id", s(file.id()));

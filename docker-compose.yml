@@ -82,3 +82,17 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
+
+  jaeger:
+    # Traces: OTLP over HTTP on :4318, UI on :16686. Only with `scripts/dev.sh tracing`
+    # (profile "tracing"); in memory, so traces are gone when it stops.
+    profiles: [tracing]
+    image: jaegertracing/jaeger:2.23.0
+    ports:
+      - "4318:4318"
+      - "16686:16686"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:16686/ || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20

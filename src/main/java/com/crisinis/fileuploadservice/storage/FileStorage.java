@@ -17,6 +17,7 @@ import java.util.function.Supplier;
 import com.crisinis.fileuploadservice.config.FileUploadServiceProperties;
 import com.crisinis.fileuploadservice.model.FileType;
 import com.crisinis.fileuploadservice.service.DependencyUnavailableException;
+import io.micrometer.observation.annotation.Observed;
 import org.springframework.stereotype.Component;
 import software.amazon.awssdk.core.ResponseInputStream;
 import software.amazon.awssdk.core.exception.SdkException;
@@ -107,6 +108,7 @@ public class FileStorage {
      *
      * @throws ObjectExistsException if an object with this id is already there
      */
+    @Observed(name = "file-upload-service.quarantine.store", contextualName = "file-storage#store")
     public void store(String id, FileType type, long size, InputStream body) {
         PutObjectRequest request = quarantinePut(id, type, size).toBuilder()
                 .overrideConfiguration(c -> c.apiCallTimeout(streamTimeout).apiCallAttemptTimeout(streamTimeout))

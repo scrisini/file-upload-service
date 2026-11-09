@@ -29,6 +29,7 @@ import com.crisinis.fileuploadservice.storage.PresignedUpload;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.observation.annotation.Observed;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
@@ -112,6 +113,8 @@ public class UploadService {
      *
      * @param declared the file; its size is the request's Content-Length, -1 when it has none (chunked)
      */
+    @Observed(name = "file-upload-service.upload.stream", contextualName = "upload-service#stream",
+            lowCardinalityKeyValues = {"method", "stream"})
     public UploadResult stream(DeclaredFile declared, InputStream body, Optional<IdempotencyKey> key) {
         if (declared.size() < 0) {
             throw reject(UploadMethod.STREAM, Reason.LENGTH_REQUIRED, "send the file with a Content-Length header");
