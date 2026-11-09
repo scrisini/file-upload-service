@@ -530,6 +530,7 @@ Logs are built for production support and log processors (ELK, Splunk, New Relic
 | `file-upload-service.extraction.time-to-complete` | timer, p50/p95/p99 | from the file becoming available to its policy being stored |
 | `file-upload-service.extraction.tokens` | counter | `direction` (`input`, `output`): Bedrock tokens (cost) |
 | `file-upload-service.recovery` | counter | `action` (`promotion_resumed`, `result_from_tag`): files [crash recovery](#crash-safety) finished |
+| `file-upload-service.upload.presigned` | timer (`@Observed`) | `method`, `class`, `exception`: a presigned-URL request (creating the record and signing the URL, not the client's PUT); see [Tracing](#tracing) |
 | `file-upload-service.upload.stream` | timer (`@Observed`) | `method`, `class`, `exception`: a streamed upload, end to end; see [Tracing](#tracing) |
 | `file-upload-service.file.create` | timer (`@Observed`) | `class`, `method`, `exception`: creating the file's record in DynamoDB |
 | `file-upload-service.quarantine.store` | timer (`@Observed`) | `class`, `method`, `exception`: streaming the bytes to quarantine |
@@ -561,6 +562,7 @@ public UploadResult stream(DeclaredFile declared, InputStream body, Optional<Ide
 
 | Annotated method | Observation (timer) | Span |
 |---|---|---|
+| `UploadService.requestUpload` | `file-upload-service.upload.presigned` | `upload-service#presigned` |
 | `UploadService.stream` | `file-upload-service.upload.stream` | `upload-service#stream` |
 | `FileRepository.createIfAbsent` | `file-upload-service.file.create` | `file-repository#createIfAbsent` |
 | `FileStorage.store` | `file-upload-service.quarantine.store` | `file-storage#store` |
