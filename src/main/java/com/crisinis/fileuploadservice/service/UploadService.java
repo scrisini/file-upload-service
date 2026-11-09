@@ -86,6 +86,8 @@ public class UploadService {
      * idempotency key a retry gets the same file: a fresh URL while its bytes haven't landed, and
      * no URL once they have.
      */
+    @Observed(name = "file-upload-service.upload.presigned", contextualName = "upload-service#presigned",
+            lowCardinalityKeyValues = {"method", "presigned"})
     public UploadResult requestUpload(DeclaredFile declared, Optional<IdempotencyKey> key) {
         FileType type = accept(UploadMethod.PRESIGNED_URL, declared);
         long size = declared.size();
